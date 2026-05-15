@@ -72,6 +72,37 @@ function Add-PodeRunspace {
     )
 
     try {
+        # [Orbital-Command patch] Lazy pool init. New-PodeRunspacePool
+        # (Private/Context.ps1, called from Private/Server.ps1:96) creates the
+        # per-type pool wrapper AFTER the user scriptblock at Server.ps1:71 has
+        # run. Any code path that calls Invoke-PodeTask from inside the user
+        # scriptblock therefore hits "The property 'LastId' cannot be found on
+        # this object" because $PodeContext.RunspacePools[$Type] doesn't
+        # exist yet. Create the wrapper on demand so the call site doesn't
+        # have to know about Pode's startup ordering. The Pool will be
+        # opened later by the normal Open-PodeRunspacePool flow; pipelines
+        # queued in the meantime run as soon as that happens.
+        if ($null -eq $PodeContext.RunspacePools[$Type]) {
+            $threadCount = switch ($Type) {
+                'Tasks'      { $PodeContext.Threads.Tasks }
+                'Timers'     { $PodeContext.Threads.Timers }
+                'Schedules'  { $PodeContext.Threads.Schedules }
+                'WebSockets' { $PodeContext.Threads.WebSockets + 1 }
+                'Files'      { $PodeContext.Threads.Files + 1 }
+                'Web'        { $PodeContext.Threads.General + 2 }
+                'Signals'    { $PodeContext.Threads.General + 2 }
+                'Smtp'       { $PodeContext.Threads.General + 1 }
+                'Tcp'        { $PodeContext.Threads.General + 1 }
+                default      { $PodeContext.Threads.General + 1 }
+            }
+            if ($threadCount -lt 1) { $threadCount = 1 }
+            $PodeContext.RunspacePools[$Type] = @{
+                Pool   = [runspacefactory]::CreateRunspacePool(1, $threadCount, $PodeContext.RunspaceState, $Host)
+                State  = 'Waiting'
+                LastId = 0
+            }
+        }
+
         # Define the script block to open the runspace and set its state.
         $openRunspaceScript = {
             param([string]$Type, [string]$Name, [bool]$NoProfile)

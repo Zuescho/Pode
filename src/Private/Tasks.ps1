@@ -8,6 +8,8 @@ function Start-PodeTaskHousekeeper {
     }
 
     Add-PodeTimer -Name '__pode_task_housekeeper__' -Interval 20 -ScriptBlock {
+        # [Orbital-Command patch] Five concurrency fixes vs. upstream 2.13.2.
+        # See PATCHES.md at the repo root and plan §15d in Orbital-Command.
         try {
             # return if no task processes
             if ($PodeContext.Tasks.Processes.Count -eq 0) {
@@ -17,12 +19,46 @@ function Start-PodeTaskHousekeeper {
             # get the current time
             $now = [datetime]::UtcNow
 
+            # [Orbital-Command patch] Keys.Clone() does not safely snapshot a
+            # synchronized hashtable on PowerShell 7 — calling Remove() inside
+            # the loop throws "Collection was modified". @(...) materialises
+            # a real array.
+            $keysSnapshot = @($PodeContext.Tasks.Processes.Keys)
+
             # loop through each process
-            foreach ($key in $PodeContext.Tasks.Processes.Keys.Clone()) {
+            foreach ($key in $keysSnapshot) {
                 try {
                     # get the process and the task
                     $process = $PodeContext.Tasks.Processes[$key]
+
+                    # [Orbital-Command patch] $process may have been removed by
+                    # Close-PodeTaskInternal between the snapshot and now.
+                    if ($null -eq $process) { continue }
+                    # [Orbital-Command patch] Half-constructed entry — Task
+                    # name not set yet. Skip; Items[$null] would null-deref.
+                    if ($null -eq $process.Task) { continue }
+
                     $task = $PodeContext.Tasks.Items[$process.Task]
+
+                    # [Orbital-Command patch] Items[$name] returns $null if
+                    # the task was removed (Clear-PodeTasks / Remove-PodeTask)
+                    # while one of its processes was still in flight. The
+                    # Failed branch below would null-deref $task.Retry.Max.
+                    if ($null -eq $task) { continue }
+
+                    # [Orbital-Command patch] $process.Runspace is $null in two
+                    # cases: (a) the brief window inside Invoke-PodeTaskInternal
+                    # between inserting the process and assigning its runspace
+                    # (transient — skip and let the next pass see it), or
+                    # (b) Add-PodeRunspace itself threw and left an orphan
+                    # (permanent — sweep after 60s).
+                    if ($null -eq $process.Runspace) {
+                        if ($null -ne $process.CreateTime -and
+                            $process.CreateTime.AddSeconds(60) -lt $now) {
+                            $null = $PodeContext.Tasks.Processes.Remove($key)
+                        }
+                        continue
+                    }
 
                     # if completed, and no completed time set, then set one and continue
                     if ($process.Runspace.Handler.IsCompleted -and ($null -eq $process.CompletedTime)) {
@@ -32,7 +68,12 @@ function Start-PodeTaskHousekeeper {
                     }
 
                     # if the process is completed, then close and remove
-                    if (($process.State -ieq 'Completed') -and ($process.CompletedTime.AddMinutes(1) -lt $now)) {
+                    # [Orbital-Command patch] Null-check CompletedTime before
+                    # AddMinutes(1) — State='Completed' without CompletedTime
+                    # shouldn't normally happen but does for residual orphans.
+                    if (($process.State -ieq 'Completed') -and `
+                        ($null -ne $process.CompletedTime) -and `
+                        ($process.CompletedTime.AddMinutes(1) -lt $now)) {
                         Close-PodeTaskInternal -Process $process
                         continue
                     }
@@ -61,7 +102,9 @@ function Start-PodeTaskHousekeeper {
                     }
 
                     # if the process is running, and the expire time has passed, then close and remove
-                    if ($process.ExpireTime -lt $now) {
+                    # [Orbital-Command patch] Null-check ExpireTime symmetric
+                    # to CompletedTime above.
+                    if ($null -ne $process.ExpireTime -and $process.ExpireTime -lt $now) {
                         Close-PodeTaskInternal -Process $process
                         continue
                     }
@@ -176,11 +219,22 @@ function Invoke-PodeTaskInternal {
         }
 
         # start the task runspace
+        # [Orbital-Command patch] Wrap Add-PodeRunspace + Runspace assignment
+        # in a nested try so a failure here rolls back the half-constructed
+        # Processes[$processId] entry. Without this, an exception leaves an
+        # orphan with Runspace=$null that the housekeeper has to sweep.
         $scriptblock = Get-PodeTaskScriptBlock
-        $runspace = Add-PodeRunspace -Type Tasks -Name $Task.Name -ScriptBlock $scriptblock -Parameters $parameters -OutputStream $result -PassThru
+        try {
+            $runspace = Add-PodeRunspace -Type Tasks -Name $Task.Name -ScriptBlock $scriptblock -Parameters $parameters -OutputStream $result -PassThru
 
-        # add runspace to process
-        $PodeContext.Tasks.Processes[$processId].Runspace = $runspace
+            # add runspace to process
+            $PodeContext.Tasks.Processes[$processId].Runspace = $runspace
+        }
+        catch {
+            # roll back the orphaned entry, then rethrow
+            $null = $PodeContext.Tasks.Processes.Remove($processId)
+            throw
+        }
 
         # return the task process
         return $PodeContext.Tasks.Processes[$processId]
