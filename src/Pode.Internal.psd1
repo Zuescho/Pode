@@ -11,7 +11,9 @@
     RootModule        = 'Pode.Internal.psm1'
 
     # Version number of this module.
-    ModuleVersion     = '$version$'
+    # [Orbital-Command patch] Replaced the upstream '$version$' build-time
+    # placeholder. See PATCHES.md.
+    ModuleVersion     = '2.13.2'
 
     # ID used to uniquely identify this module
     GUID              = '86b48c1c-8b59-4f3c-80bb-936d6b3218f6'

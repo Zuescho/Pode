@@ -57,9 +57,23 @@ object`.
 
 The patch adds a lazy-init guard at the top of `Add-PodeRunspace`: if the
 wrapper for `$Type` is missing, create it on demand with `Pool` /
-`State='Waiting'` / `LastId=0`. The Pool object is opened later by the
-normal `Open-PodeRunspacePool` flow; any pipelines queued in the meantime
-run as soon as that happens (standard .NET RunspacePool behaviour).
+`State='Waiting'` / `LastId=0`, then immediately call `.Pool.Open()` so
+`BeginInvoke` can succeed right away. (Without the `.Open()` step the
+caller hits `Cannot perform the operation because the runspace pool is
+not in the 'Opened' state`.) Pode's normal `Open-PodeRunspacePool` flow at
+`Server.ps1:97` later replaces the lazy pool with the canonical one for
+that type, so this is genuinely a startup-window shim, not a permanent
+extra pool. `.Open()` is idempotent.
+
+### 4. `src/Private/Schedules.ps1` — `Start-PodeScheduleRunspace` housekeeper
+
+Pode 2.13.2 ships the same race-vulnerable housekeeper for schedules as for
+tasks: line 34 dereferences `$process.Runspace.Handler.IsCompleted` without
+a null-check, and line 29 uses `Keys.Clone()` on a synchronized hashtable.
+Mirror the task-housekeeper patch: `@(Keys)` snapshot, null-checks for
+`$process` / `$process.Runspace` / `$process.ExpireTime` before
+dereferencing. Same surfaced symptom (`You cannot call a method on a
+null-valued expression`), same fix shape.
 
 ## Upgrade procedure
 

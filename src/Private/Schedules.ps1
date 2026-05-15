@@ -19,6 +19,9 @@ function Start-PodeScheduleRunspace {
     }
 
     Add-PodeTimer -Name '__pode_schedule_housekeeper__' -Interval 30 -ScriptBlock {
+        # [Orbital-Command patch] Same shape as the task housekeeper fixes
+        # in Private/Tasks.ps1 — defensive null-checks for entries that get
+        # raced or half-constructed. See PATCHES.md.
         try {
             if ($PodeContext.Schedules.Processes.Count -eq 0) {
                 return
@@ -26,12 +29,29 @@ function Start-PodeScheduleRunspace {
 
             $now = [datetime]::UtcNow
 
-            foreach ($key in $PodeContext.Schedules.Processes.Keys.Clone()) {
+            # [Orbital-Command patch] @(Keys) instead of Keys.Clone() — see
+            # Tasks.ps1 patch for the synchronized-hashtable snapshot rationale.
+            $keysSnapshot = @($PodeContext.Schedules.Processes.Keys)
+
+            foreach ($key in $keysSnapshot) {
                 try {
                     $process = $PodeContext.Schedules.Processes[$key]
 
+                    # [Orbital-Command patch] Entry may have been removed by
+                    # Close-PodeScheduleInternal between snapshot and now.
+                    if ($null -eq $process) { continue }
+                    # [Orbital-Command patch] Half-constructed entry —
+                    # $process.Runspace not yet assigned by Invoke-PodeInternalSchedule.
+                    # Skip; either transient (assignment imminent) or orphaned
+                    # (Add-PodeRunspace threw and left a half-built record).
+                    if ($null -eq $process.Runspace) { continue }
+
                     # if it's completed or expired, dispose and remove
-                    if ($process.Runspace.Handler.IsCompleted -or ($process.ExpireTime -lt $now)) {
+                    # [Orbital-Command patch] Null-check ExpireTime before
+                    # comparing to $now — half-constructed records can have
+                    # CreateTime but no ExpireTime depending on the path.
+                    $expired = ($null -ne $process.ExpireTime) -and ($process.ExpireTime -lt $now)
+                    if ($process.Runspace.Handler.IsCompleted -or $expired) {
                         Close-PodeScheduleInternal -Process $process
                     }
                 }

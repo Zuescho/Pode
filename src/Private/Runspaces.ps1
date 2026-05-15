@@ -96,8 +96,16 @@ function Add-PodeRunspace {
                 default      { $PodeContext.Threads.General + 1 }
             }
             if ($threadCount -lt 1) { $threadCount = 1 }
+            $pool = [runspacefactory]::CreateRunspacePool(1, $threadCount, $PodeContext.RunspaceState, $Host)
+            # Open the pool so BeginInvoke can run immediately. Pode's normal
+            # flow opens pools via Open-PodeRunspacePool at Server.ps1:97, but
+            # the lazy path here runs DURING the user scriptblock at Server.ps1:71
+            # — much earlier. Opening on creation means user-scriptblock
+            # Invoke-PodeTask calls work without "pool not in Opened state"
+            # errors. .Open() is idempotent.
+            $pool.Open()
             $PodeContext.RunspacePools[$Type] = @{
-                Pool   = [runspacefactory]::CreateRunspacePool(1, $threadCount, $PodeContext.RunspaceState, $Host)
+                Pool   = $pool
                 State  = 'Waiting'
                 LastId = 0
             }
