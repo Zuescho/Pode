@@ -11,7 +11,10 @@
     RootModule        = 'Pode.psm1'
 
     # Version number of this module.
-    ModuleVersion     = '$version$'
+    # [Orbital-Command patch] Replaced the upstream '$version$' build-time
+    # placeholder with the literal so the manifest can be loaded directly
+    # without going through pode.build.ps1. See PATCHES.md.
+    ModuleVersion     = '2.13.2'
 
     # ID used to uniquely identify this module
     GUID              = 'e3ea217c-fc3d-406b-95d5-4304ab06c6af'
