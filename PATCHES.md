@@ -96,6 +96,29 @@ $src = "$home\Documents\PowerShell\Modules\Pode\<new-version>\Libs"
 Copy-Item $src -Destination src/Libs -Recurse -Force
 ```
 
+### Compatibility checks before declaring the rebase done
+
+Orbital-Command relies on two private-API surfaces that aren't covered by Pode's
+test suite. Verify both still behave as expected after each rebase — they're
+the load-bearing parts of the cold-start fix (Orbital-Command plan §15j):
+
+1. **`Import-PodeModulesIntoRunspaceState` in `src/Private/AutoImport.ps1`** —
+   must enumerate `Get-Module` and call `$PodeContext.RunspaceState.ImportPSModule()`
+   for each loaded module BEFORE the task runspace pool is opened (currently
+   ordered at `src/Private/Server.ps1:78` for auto-import vs `:96` for pool
+   creation). Orbital-Command's `server.ps1` relies on this to preload the
+   ActiveDirectory module into every task runspace via the cloned
+   `InitialSessionState`. If the rebase reorders pool creation BEFORE auto-import,
+   AD-task routes will pay the cold-load cost on every first call after
+   restart (~30s) and the `<No file>: line N` error class returns.
+2. **`Set-PodeTaskConcurrency`** — must remain public and accept `-Maximum N`.
+   Used at `Orbital-Command/server.ps1` task-pool-sizing block.
+
+Smoke test after rebase: restart `server.ps1`, hit `/api/users/<sam>/groups/fresh`
+within the first 10 seconds of healthy. Should respond in ≤4s and emit zero new
+entries in `logs/errors_*.log`. If first-call latency is >20s or the line-26
+error reappears, the auto-import ordering broke.
+
 ## Not upstreamed
 
 Deliberate, as of 2026-05-15. Observing locally first to confirm the patches
