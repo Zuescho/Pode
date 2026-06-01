@@ -2,9 +2,10 @@
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
-via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Three concurrency bugs in
-Pode 2.13.2's task-pool plumbing are fixed here; everything else is unchanged
-upstream. See Orbital-Command's `docs/Platform-Plan.md` §15d for the full
+via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Five bugs are fixed here:
+four concurrency races in the task/schedule-pool plumbing, and one Int32
+truncation in the IIS auth handler. Everything else is unchanged upstream.
+See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
 diagnosis.
 
 ## Branch state
@@ -74,6 +75,47 @@ Mirror the task-housekeeper patch: `@(Keys)` snapshot, null-checks for
 `$process` / `$process.Runspace` / `$process.ExpireTime` before
 dereferencing. Same surfaced symptom (`You cannot call a method on a
 null-valued expression`), same fix shape.
+
+### 5. `src/Private/Authentication.ps1` — `Get-PodeAuthWindowsADIISMethod`
+
+`MS-ASPNETCORE-WINAUTHTOKEN` is the impersonation token IIS passes through
+the AspNetCoreModuleV2 to the downstream worker. The header value is the
+hex representation of a Windows `HANDLE` — a 64-bit value on x64.
+
+Pode 2.13.2's line 987 parses it with:
+
+```powershell
+$winAuthToken = [System.IntPtr][Int]"0x$($token)"
+```
+
+`[Int]` is `[Int32]`. PowerShell parses `"0xFFFFFFFF"` style strings as
+hex fine, but on x64 every handle that doesn't fit in 31 bits is silently
+sign-extended to a *different* 64-bit IntPtr. `WindowsIdentity::new` then
+calls `DuplicateTokenEx` on that corrupted handle and the kernel returns
+`ERROR_INVALID_HANDLE`, surfaced as the managed message:
+
+> Exception calling ".ctor" with "2" argument(s): "Invalid token for
+> impersonation - it cannot be duplicated."
+
+On the IIS-hosted Orbital-Command install the call site fires for every
+request (auth middleware) so the error log accumulated ~3 paired entries
+per second. The paired downstream error (`The property 'Headers' cannot
+be found on this object` at `Authentication.ps1:1332`) is chained
+reportage of the same failure — the catch returns a hashtable with only
+`Message`, and the validator builds the 401 response shape from it.
+
+Patch: parse as Int64 explicitly and reject empty tokens up-front with a
+clean 401 instead of letting `[Convert]::ToInt64('', 16)` throw into the
+catch:
+
+```powershell
+if ([string]::IsNullOrEmpty($token)) {
+    return @{ Message = 'Empty WINAUTHTOKEN'; Code = 401 }
+}
+$winAuthToken = [System.IntPtr]::new([Convert]::ToInt64($token, 16))
+```
+
+Upstream `develop` is unchanged (verified 2026-06-01). Worth a PR.
 
 ## Upgrade procedure
 

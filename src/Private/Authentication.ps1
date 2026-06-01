@@ -983,8 +983,14 @@ function Get-PodeAuthWindowsADIISMethod {
 '@
 
         try {
-            # parse the auth token and get the user
-            $winAuthToken = [System.IntPtr][Int]"0x$($token)"
+            # parse the auth token and get the user.
+            # Token is a 64-bit kernel HANDLE on x64; [Int] (Int32) silently
+            # truncates and WindowsIdentity::new then fails with "Invalid token
+            # for impersonation - it cannot be duplicated". Parse as Int64.
+            if ([string]::IsNullOrEmpty($token)) {
+                return @{ Message = 'Empty WINAUTHTOKEN'; Code = 401 }
+            }
+            $winAuthToken = [System.IntPtr]::new([Convert]::ToInt64($token, 16))
             $winIdentity = [System.Security.Principal.WindowsIdentity]::new($winAuthToken, 'Windows')
 
             # get user and domain
