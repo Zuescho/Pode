@@ -106,13 +106,32 @@ reportage of the same failure — the catch returns a hashtable with only
 
 Patch: parse as Int64 explicitly and reject empty tokens up-front with a
 clean 401 instead of letting `[Convert]::ToInt64('', 16)` throw into the
-catch:
+catch. Trim + optional `0x`-prefix strip before the parse — `Convert.ToInt64`
+with `-fromBase 16` does NOT accept either, whereas the upstream `[Int]"0x..."`
+form did. Without the strip we'd break differently than upstream on
+hypothetical `0x`-prefixed headers (ANCM normally sends bare hex):
 
 ```powershell
 if ([string]::IsNullOrEmpty($token)) {
     return @{ Message = 'Empty WINAUTHTOKEN'; Code = 401 }
 }
-$winAuthToken = [System.IntPtr]::new([Convert]::ToInt64($token, 16))
+$parsed = $token.Trim()
+if ($parsed.StartsWith('0x', [System.StringComparison]::OrdinalIgnoreCase)) {
+    $parsed = $parsed.Substring(2)
+}
+$winAuthToken = [System.IntPtr]::new([Convert]::ToInt64($parsed, 16))
+```
+
+The `finally` block at the end of the function also gets a null-guard so
+the empty-token short-circuit and any pre-`WindowsIdentity` parse failure
+don't end up calling `CloseHandle(IntPtr.Zero)`:
+
+```powershell
+finally {
+    if ($null -ne $winAuthToken -and $winAuthToken -ne [System.IntPtr]::Zero) {
+        $win32Handler::CloseHandle($winAuthToken)
+    }
+}
 ```
 
 Upstream `develop` is unchanged (verified 2026-06-01). Worth a PR.

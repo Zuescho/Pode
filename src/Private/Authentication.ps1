@@ -987,10 +987,16 @@ function Get-PodeAuthWindowsADIISMethod {
             # Token is a 64-bit kernel HANDLE on x64; [Int] (Int32) silently
             # truncates and WindowsIdentity::new then fails with "Invalid token
             # for impersonation - it cannot be duplicated". Parse as Int64.
+            # Trim and strip an optional 0x prefix defensively — ANCM sends
+            # bare hex but Convert.ToInt64 throws on either when -fromBase 16.
             if ([string]::IsNullOrEmpty($token)) {
                 return @{ Message = 'Empty WINAUTHTOKEN'; Code = 401 }
             }
-            $winAuthToken = [System.IntPtr]::new([Convert]::ToInt64($token, 16))
+            $parsed = $token.Trim()
+            if ($parsed.StartsWith('0x', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $parsed = $parsed.Substring(2)
+            }
+            $winAuthToken = [System.IntPtr]::new([Convert]::ToInt64($parsed, 16))
             $winIdentity = [System.Security.Principal.WindowsIdentity]::new($winAuthToken, 'Windows')
 
             # get user and domain
@@ -1090,7 +1096,12 @@ function Get-PodeAuthWindowsADIISMethod {
             return @{ Message = 'Failed to retrieve user using Authentication Token' }
         }
         finally {
-            $win32Handler::CloseHandle($winAuthToken)
+            # Empty-token short-circuit and any pre-WindowsIdentity parse
+            # failure leave $winAuthToken unset; skip the handle close so
+            # we don't call CloseHandle(IntPtr.Zero) and dirty the trace.
+            if ($null -ne $winAuthToken -and $winAuthToken -ne [System.IntPtr]::Zero) {
+                $win32Handler::CloseHandle($winAuthToken)
+            }
         }
 
         # is the user valid for any users/groups - if not, error!
