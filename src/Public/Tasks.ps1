@@ -605,7 +605,11 @@ function Get-PodeTaskProcess {
         $State = 'All'
     )
 
-    $processes = $PodeContext.Tasks.Processes.Values
+    # [Orbital-Command patch #6] Snapshot the live view — enumerating
+    # .Values directly races a concurrent Remove (housekeeper / Close) into
+    # "Collection was modified". Same family as the housekeeper's @(Keys)
+    # snapshot in patch #1.
+    $processes = @($PodeContext.Tasks.Processes.Values)
 
     # filter processes by name
     if (($null -ne $Name) -and ($Name.Length -gt 0)) {

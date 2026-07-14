@@ -148,6 +148,54 @@ Heads-up for the next rebase: `develop` adds a `Logs` runspace type to
 bare `throw` in `Runspaces.ps1`/`Schedules.ps1` — adjacent to patches 3
 and 4 but different lines; expect at most trivial conflicts.
 
+### 6. `src/Private/Tasks.ps1` — `Close-PodeTaskInternal` (real cancel) + `src/Public/Tasks.ps1` — `Get-PodeTaskProcess` snapshot
+
+Stock `Close-PodeTaskInternal` tears a task down with
+`Close-PodeDisposable → Dispose()` only. Two problems once tasks are closed
+while RUNNING — which Orbital-Command now does routinely (manifest
+`MaxRuntimeMinutes` → `Invoke-PodeTask -Timeout`, plus the
+`/api/runs/:id/cancel` route):
+
+1. **`Dispose()` on a running pipeline performs a synchronous `Stop()`.** A
+   pipeline wedged inside a blocking native call (hung LDAP / WinRM — the
+   exact things a runaway collector waits on) can never reach Stopped, so
+   the housekeeper thread hangs and every future timeout enforcement dies
+   with it. The patch calls `BeginStop()` (never blocks), polls
+   `InvocationStateInfo.State` for up to 3 s, disposes only once the
+   pipeline actually left Running/Stopping, and otherwise ABANDONS the
+   object to the GC finalizer with a loud error-log entry. An abandoned
+   runner slot stays busy until its blocking call returns — unavoidable on
+   .NET Core (no thread aborts) — but the housekeeper survives to enforce
+   every other task's timeout. **`Stopping` is deliberately treated exactly
+   like `Running`** in both the entry check and the poll: a pipeline enters
+   Stopping the instant a CONCURRENT Close calls `BeginStop` (the cancel
+   route racing the housekeeper's expiry close); treating it as "already
+   stopped" would `Dispose()` a not-yet-stopped pipeline — the very hang
+   this patch exists to prevent. A state probe on a mid-teardown pipeline
+   can throw `ObjectDisposedException` — caught and treated as "someone
+   else already stopped it".
+2. **Concurrent table mutation.** `Processes` is a plain hashtable — safe
+   for many readers plus ONE writer; concurrent `.Remove()` is the same
+   torn-state family patch #1 guards against. All three `Remove` paths are
+   serialised via `Lock-PodeObject -Object
+   $PodeContext.Threading.Lockables.Global`: Close's own Remove, and the
+   housekeeper's orphan-sweep Remove (Runspace-null branch).
+   `Get-PodeTaskProcess` additionally snapshots `.Values` (`@(...)`) —
+   direct enumeration races a concurrent Remove into "Collection was
+   modified" (the cancel route enumerates it per request).
+
+Note: disposing `$Process.Result` in the abandoned branch is deliberate —
+a wedged pipeline that eventually resumes and writes to its output
+collection throws into the (already dead) task body, which helps kill it;
+expect occasional `ObjectDisposedException` noise in the error log from
+exactly that. Empirical stop-semantics ground truth (measured on PS7):
+during a `BeginStop`, `finally` blocks still execute (including cmdlet
+calls); `catch` blocks are SKIPPED — consumer code must put cleanup in
+flag-guarded `finally` blocks.
+
+Upstream `develop` is unchanged here (no `.Stop()`/`BeginStop` anywhere in
+the task teardown path). Worth a PR together with patches 1/2.
+
 ## Upgrade procedure
 
 When Pode releases a new version:

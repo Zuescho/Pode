@@ -55,7 +55,14 @@ function Start-PodeTaskHousekeeper {
                     if ($null -eq $process.Runspace) {
                         if ($null -ne $process.CreateTime -and
                             $process.CreateTime.AddSeconds(60) -lt $now) {
-                            $null = $PodeContext.Tasks.Processes.Remove($key)
+                            # [Orbital-Command patch #6] Serialise like
+                            # Close-PodeTaskInternal's Remove — with the
+                            # cancel route, a concurrent Close can mutate the
+                            # table at the same moment (Hashtable tolerates
+                            # only ONE writer).
+                            Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+                                $null = $PodeContext.Tasks.Processes.Remove($key)
+                            }
                         }
                         continue
                     }
@@ -162,14 +169,26 @@ function Close-PodeTaskInternal {
     }
 
     if ($null -ne $pipeline) {
+        # 'Stopping' must be treated exactly like 'Running' (both in the
+        # entry check and the poll): a pipeline enters Stopping the instant
+        # BeginStop is requested — including by a CONCURRENT Close (the
+        # cancel route racing the housekeeper's expiry close). Treating
+        # Stopping as "already stopped" would dispose immediately, and
+        # PowerShell.Dispose() on a not-yet-stopped pipeline performs a
+        # SYNCHRONOUS Stop() — the indefinite hang this patch exists to
+        # prevent.
+        $liveStates = @(
+            [System.Management.Automation.PSInvocationState]::Running,
+            [System.Management.Automation.PSInvocationState]::Stopping
+        )
         $stopped = $true
         try {
-            if ($pipeline.InvocationStateInfo.State -eq [System.Management.Automation.PSInvocationState]::Running) {
+            if ($pipeline.InvocationStateInfo.State -in $liveStates) {
                 $stopped = $false
                 try { $null = $pipeline.BeginStop($null, $null) } catch { }
                 $deadline = [datetime]::UtcNow.AddSeconds(3)
                 while ([datetime]::UtcNow -lt $deadline) {
-                    if ($pipeline.InvocationStateInfo.State -ne [System.Management.Automation.PSInvocationState]::Running) {
+                    if ($pipeline.InvocationStateInfo.State -notin $liveStates) {
                         $stopped = $true
                         break
                     }
@@ -194,6 +213,12 @@ function Close-PodeTaskInternal {
         }
     }
 
+    # NB: disposing Result here even in the abandoned branch is deliberate —
+    # a wedged pipeline that eventually resumes and writes to its output
+    # collection throws into the (already dead) task body, which helps kill
+    # it; the run row is reconciled by Orbital-Command's over-budget sweep
+    # either way. Expect an occasional ObjectDisposedException in the error
+    # log from exactly that.
     Close-PodeDisposable -Disposable $Process.Result
 
     # remove the process (serialised — see header comment)
