@@ -277,8 +277,13 @@ function Invoke-PodeTaskInternal {
         }
 
         # add task process
+        # [Orbital-Command patch #6] The table insert is serialised under the
+        # same global lockable as every Remove and the Get-PodeTaskProcess
+        # snapshot — a Hashtable tolerates concurrent READERS with one
+        # writer, but an unserialised add during a locked enumeration still
+        # tears. Build the entry first, hold the lock only for the insert.
         $result = [System.Management.Automation.PSDataCollection[psobject]]::new()
-        $PodeContext.Tasks.Processes[$processId] = @{
+        $processEntry = @{
             ID            = $processId
             Task          = $Task.Name
             Parameters    = $parameters
@@ -299,6 +304,9 @@ function Invoke-PodeTaskInternal {
             }
             State         = 'Pending'
         }
+        Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+            $PodeContext.Tasks.Processes[$processId] = $processEntry
+        }
 
         # start the task runspace
         # [Orbital-Command patch] Wrap Add-PodeRunspace + Runspace assignment
@@ -310,16 +318,18 @@ function Invoke-PodeTaskInternal {
             $runspace = Add-PodeRunspace -Type Tasks -Name $Task.Name -ScriptBlock $scriptblock -Parameters $parameters -OutputStream $result -PassThru
 
             # add runspace to process
-            $PodeContext.Tasks.Processes[$processId].Runspace = $runspace
+            $processEntry.Runspace = $runspace
         }
         catch {
-            # roll back the orphaned entry, then rethrow
-            $null = $PodeContext.Tasks.Processes.Remove($processId)
+            # roll back the orphaned entry (serialised like every Remove), then rethrow
+            Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+                $null = $PodeContext.Tasks.Processes.Remove($processId)
+            }
             throw
         }
 
         # return the task process
-        return $PodeContext.Tasks.Processes[$processId]
+        return $processEntry
     }
     catch {
         $_ | Write-PodeErrorLog
@@ -465,7 +475,13 @@ function Get-PodeTaskScriptBlock {
             $_ | Write-PodeErrorLog
         }
         finally {
-            $process.CompletedTime = [datetime]::UtcNow
+            # [Orbital-Command patch #6] Null-guard: when the process entry
+            # was removed before start (a cancelled queued task whose
+            # abandoned pipeline later got a pool slot), the throw above
+            # leaves $process = $null — the catch guards it, this didn't.
+            if ($null -ne $process) {
+                $process.CompletedTime = [datetime]::UtcNow
+            }
             Reset-PodeRunspaceName
             Invoke-PodeGC
         }
