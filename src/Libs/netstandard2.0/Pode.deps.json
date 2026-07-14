@@ -7,7 +7,7 @@
   "targets": {
     ".NETStandard,Version=v2.0": {},
     ".NETStandard,Version=v2.0/": {
-      "Pode/2.13.2": {
+      "Pode/2.13.4": {
         "dependencies": {
           "Kerberos.NET": "4.6.146"
         },
@@ -163,7 +163,7 @@
     }
   },
   "libraries": {
-    "Pode/2.13.2": {
+    "Pode/2.13.4": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

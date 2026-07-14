@@ -1,4 +1,4 @@
-# Orbital-Command local patches against Pode 2.13.2
+# Orbital-Command local patches against Pode 2.13.4
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
@@ -10,9 +10,14 @@ diagnosis.
 
 ## Branch state
 
-- Branched from upstream tag `v2.13.2` on `orbital-command-patches`.
+- Branched from upstream tag `v2.13.2` on `orbital-command-patches`;
+  rebased onto `v2.13.4` on 2026-07-14 (clean rebase, no conflicts —
+  upstream's only touch on a patched file was `Invoke-PodeAuthEvent` in
+  `Authentication.ps1`, a different function than our patch 5 target).
+  `src/Libs/` refreshed from the PSGallery 2.13.4 release (picks up the
+  #1717 socket-close fix in `PodeRequestHandler.cs`).
 - `upstream` remote points at https://github.com/Badgerati/Pode.git.
-- `git log upstream/v2.13.2..HEAD` shows our delta as discrete commits.
+- `git log v2.13.4..HEAD` shows our delta as discrete commits.
 
 ## The three patches
 
@@ -134,7 +139,13 @@ finally {
 }
 ```
 
-Upstream `develop` is unchanged (verified 2026-06-01). Worth a PR.
+Upstream `develop` is unchanged — line 987 still parses with `[Int]`
+(re-verified 2026-07-14 against `develop` post-v2.13.4). Worth a PR.
+
+Heads-up for the next rebase: `develop` adds a `Logs` runspace type to
+`Add-PodeRunspace`'s `ValidateSet` and switches `throw $_.Exception` to
+bare `throw` in `Runspaces.ps1`/`Schedules.ps1` — adjacent to patches 3
+and 4 but different lines; expect at most trivial conflicts.
 
 ## Upgrade procedure
 
