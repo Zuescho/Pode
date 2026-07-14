@@ -29,9 +29,14 @@ function Start-PodeScheduleRunspace {
 
             $now = [datetime]::UtcNow
 
-            # [Orbital-Command patch] @(Keys) instead of Keys.Clone() — see
-            # Tasks.ps1 patch for the synchronized-hashtable snapshot rationale.
-            $keysSnapshot = @($PodeContext.Schedules.Processes.Keys)
+            # [Orbital-Command patch #6] Snapshot under the global lockable —
+            # see the Tasks.ps1 housekeeper for the enumerate-during-Remove
+            # rationale. Symmetry: keep the schedule table's read discipline
+            # matched to the task table's even though the new cancel paths
+            # only mutate the task table today.
+            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+                @($PodeContext.Schedules.Processes.Keys)
+            }
 
             foreach ($key in $keysSnapshot) {
                 try {

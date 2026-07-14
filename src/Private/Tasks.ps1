@@ -19,11 +19,17 @@ function Start-PodeTaskHousekeeper {
             # get the current time
             $now = [datetime]::UtcNow
 
-            # [Orbital-Command patch] Keys.Clone() does not safely snapshot a
-            # synchronized hashtable on PowerShell 7 — calling Remove() inside
-            # the loop throws "Collection was modified". @(...) materialises
-            # a real array.
-            $keysSnapshot = @($PodeContext.Tasks.Processes.Keys)
+            # [Orbital-Command patch #6] Snapshot UNDER the global lockable —
+            # a bare @(.Keys) still enumerates the live KeyCollection during
+            # the copy, so a concurrent lock-serialised Remove (cancel route /
+            # over-budget reaper Close-PodeTaskInternal) can throw "Collection
+            # was modified" and abort the whole housekeeper tick (a 20s
+            # enforcement slip). Every mutator of this table is now
+            # lock-serialised; the read must join them. (Keys.Clone() was the
+            # pre-#6 form; @(...) alone was #6 round 1 — still unlocked.)
+            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+                @($PodeContext.Tasks.Processes.Keys)
+            }
 
             # loop through each process
             foreach ($key in $keysSnapshot) {
