@@ -2,9 +2,10 @@
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
-via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Five bugs are fixed here:
-four concurrency races in the task/schedule-pool plumbing, and one Int32
-truncation in the IIS auth handler. Everything else is unchanged upstream.
+via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Six patches live here:
+four concurrency races in the task/schedule-pool plumbing, one Int32
+truncation in the IIS auth handler, and a real-cancel rework of the task
+teardown path (stop before dispose). Everything else is unchanged upstream.
 See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
 diagnosis.
 
@@ -19,7 +20,7 @@ diagnosis.
 - `upstream` remote points at https://github.com/Badgerati/Pode.git.
 - `git log v2.13.4..HEAD` shows our delta as discrete commits.
 
-## The three patches
+## The six patches
 
 ### 1. `src/Private/Tasks.ps1` — `Start-PodeTaskHousekeeper`
 

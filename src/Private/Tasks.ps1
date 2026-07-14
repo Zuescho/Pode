@@ -137,13 +137,70 @@ function Close-PodeTaskInternal {
         return
     }
 
-    # close the runspace
-    Close-PodeDisposable -Disposable $Process.Runspace.Pipeline
+    # [Orbital-Command patch #6] Real cancel + guarded teardown.
+    #
+    # Stock Pode only calls Close-PodeDisposable → Dispose() here. Two
+    # problems with that once tasks are closed while RUNNING (timeout expiry
+    # or an explicit Close-PodeTask):
+    #   a) PowerShell.Dispose() on a running pipeline performs a SYNCHRONOUS
+    #      Stop() — a pipeline wedged inside a blocking native call (hung
+    #      LDAP/WinRM) can therefore hang the housekeeper thread, and with it
+    #      every future timeout enforcement. BeginStop() never blocks; give
+    #      the pipeline a short window to reach a stopped state and only then
+    #      dispose. If it won't stop, abandon the object to the GC finalizer
+    #      and log loudly — there is no way to abort a thread stuck in native
+    #      code on .NET Core, so the runner slot is lost until the call
+    #      returns either way; what we're protecting is the housekeeper.
+    #   b) With Close now callable from HTTP routes, two Closes can race each
+    #      other (route + housekeeper expiry) — serialise the Processes
+    #      mutation via the global lockable. Hashtable tolerates concurrent
+    #      readers with ONE writer; concurrent Removes are the same torn-state
+    #      family the housekeeper snapshot patch (#1) exists for.
+    $pipeline = $null
+    if (($null -ne $Process.Runspace) -and ($null -ne $Process.Runspace.Pipeline)) {
+        $pipeline = $Process.Runspace.Pipeline
+    }
+
+    if ($null -ne $pipeline) {
+        $stopped = $true
+        try {
+            if ($pipeline.InvocationStateInfo.State -eq [System.Management.Automation.PSInvocationState]::Running) {
+                $stopped = $false
+                try { $null = $pipeline.BeginStop($null, $null) } catch { }
+                $deadline = [datetime]::UtcNow.AddSeconds(3)
+                while ([datetime]::UtcNow -lt $deadline) {
+                    if ($pipeline.InvocationStateInfo.State -ne [System.Management.Automation.PSInvocationState]::Running) {
+                        $stopped = $true
+                        break
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+        }
+        catch {
+            # reading InvocationStateInfo on a mid-teardown pipeline can throw
+            # ObjectDisposedException — another Close got here first; nothing
+            # left for us to stop.
+            $stopped = $true
+        }
+
+        if ($stopped) {
+            Close-PodeDisposable -Disposable $pipeline
+        }
+        else {
+            try {
+                [System.Exception]::new("Task process '$($Process.ID)' ($($Process.Task)) did not stop within 3s of BeginStop - pipeline abandoned to the GC finalizer; its task-pool slot stays busy until the blocking call returns.") | Write-PodeErrorLog
+            } catch { }
+        }
+    }
+
     Close-PodeDisposable -Disposable $Process.Result
 
-    # remove the process
+    # remove the process (serialised — see header comment)
     if (!$Keep) {
-        $null = $PodeContext.Tasks.Processes.Remove($Process.ID)
+        Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+            $null = $PodeContext.Tasks.Processes.Remove($Process.ID)
+        }
     }
 }
 
