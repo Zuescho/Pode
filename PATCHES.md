@@ -2,10 +2,10 @@
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
-via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Six patches live here:
+via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Seven patches live here:
 four concurrency races in the task/schedule-pool plumbing, one Int32
 truncation in the IIS auth handler, and a real-cancel rework of the task
-teardown path (stop before dispose). Everything else is unchanged upstream.
+teardown path (stop before dispose), and HTTP listener thread-pool starvation. Supply-Depot also consumes this fork. Everything else is unchanged upstream.
 See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
 diagnosis.
 
@@ -20,7 +20,7 @@ diagnosis.
 - `upstream` remote points at https://github.com/Badgerati/Pode.git.
 - `git log v2.13.4..HEAD` shows our delta as discrete commits.
 
-## The six patches
+## The seven patches
 
 ### 1. `src/Private/Tasks.ps1` — `Start-PodeTaskHousekeeper`
 
@@ -195,6 +195,49 @@ flag-guarded `finally` blocks.
 
 Upstream `develop` is unchanged here (no `.Stop()`/`BeginStop` anywhere in
 the task teardown path). Worth a PR together with patches 1/2.
+
+### 7. `src/Private/PodeServer.ps1` — HTTP context acquisition without CLR pool starvation
+
+Supply-Depot issue [#294](https://github.com/Zuescho/Supply-Depot/issues/294)
+reported ten-second HTTP timeouts after the health probe had already succeeded.
+Each HTTP listener already runs on a dedicated PowerShell runspace. Calling
+`Wait-PodeTask -Task $Listener.GetContextAsync(token)` also schedules a CLR pool
+task that blocks in `PodeItemQueue.Get` / `BlockingCollection.Take`. Sixteen idle
+HTTP workers can therefore starve the socket receive tasks that must put the
+next request into that same queue.
+
+Call the existing synchronous `GetContext(token)` on the dedicated runspace.
+The same cancellation token, queue dequeue, processing bookkeeping and outer
+`OperationCanceledException` catch remain in use. Other consumers and the
+asynchronous queue API are unchanged; no listener DLL rebuild is needed.
+This does not remove the separate cold runspace initialization delay and does
+not extend request timeouts or change configured HTTP worker concurrency.
+
+Evidence on PowerShell 7 with `DOTNET_PROCESSOR_COUNT=2`:
+
+- The actual queue implementation with sixteen pooled waiters delayed a queued
+  producer 12,283 ms (pool grew from 3 to 17 threads). Dedicated waiters delivered
+  in 31 ms with 3 pool threads.
+- A minimal real HTTP server with sixteen workers took 7,438 / 3,512 ms for
+  requests after its first successful response before the fix, versus 7 / 3 ms
+  after it. In a second patched run, post-readiness calls took 3 / 5 / 2 ms,
+  and 32 concurrent requests all succeeded in 88 ms.
+- Four workers were a useful control: both builds answered post-readiness calls
+  in 3–10 ms and all 32 concurrent requests succeeded (200 / 207 ms). The defect
+  depends on pool pressure; a fast low-concurrency run cannot disprove it.
+- Full Supply-Depot HTTP smoke with two logical processors passed all 1,282
+  assertions against the patched fork.
+
+`tests/unit/HttpListenerAcquire.Tests.ps1` runs the actual acquisition AST and
+actual queue implementation in a throwaway process with sixteen dedicated
+PowerShell workers and only two CLR pool slots. It verifies delivery, cancellation
+of the fifteen remaining workers, processing removal and disposed-queue behavior.
+Restoring the old acquisition makes all three pins fail: the producer never runs
+within the window, all sixteen workers cancel, and no item reaches processing.
+The complete Pode unit suite passes 1,949 tests with no failures; Pester reports
+one existing helper test as NotRun (1,950 discovered). Changed-file PSScriptAnalyzer is clean.
+Pool limits are changed only inside the test process. The fixture is PS7-only,
+matching the investigated environment; normal production APIs remain PS5-compatible.
 
 ## Upgrade procedure
 

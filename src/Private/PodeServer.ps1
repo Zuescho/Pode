@@ -125,8 +125,10 @@ function Start-PodeWebServer {
             do {
                 try {
                     while ($Listener.IsConnected -and !(Test-PodeCancellationTokenRequest -Type Terminate, Cancellation -Match All)) {
-                        # get request and response
-                        $context = (Wait-PodeTask -Task $Listener.GetContextAsync($PodeContext.Tokens.Cancellation.Token))
+                        # This dedicated runspace already owns the blocking worker.
+                        # GetContextAsync schedules BlockingCollection.Take on the shared
+                        # CLR pool, starving socket receive tasks when workers are idle.
+                        $context = $Listener.GetContext($PodeContext.Tokens.Cancellation.Token)
 
                         try {
                             try {
