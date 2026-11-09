@@ -338,6 +338,27 @@ within the first 10 seconds of healthy. Should respond in ≤4s and emit zero ne
 entries in `logs/errors_*.log`. If first-call latency is >20s or the line-26
 error reappears, the auto-import ordering broke.
 
+### Known 2.14.2 log noise (not a regression from these patches)
+
+At most one entry right after startup:
+
+```
+Message: You cannot call a method on a null-valued expression.
+StackTrace: at <ScriptBlock>, <No file>: line 28
+```
+
+It's the web listener (`Start-PodeWebServer`, line 28 of its scriptblock with
+patch 7's comment lines, line 26 on pristine upstream) getting a context whose
+`Request.Strategy` is still `$null`. The outer `finally` disposes the context,
+so nothing leaks and no client request goes unanswered. It's timing-dependent:
+pristine upstream 2.14.2 produces it at startup in roughly half of the test
+starts (a probe that only polls `/ping`), and the 2.13.4 fork never did in the
+same runs. Connections that are opened and dropped after startup don't
+trigger it (30 empty connects, 30 half requests, 30 abandoned requests: no
+entries). Under IIS, ANCM's startup port probes may cause one per app-pool
+start. Not worth a patch; worth an upstream issue. Not the same as the
+warmup-poller variant, which repeats for every abandoned queued context.
+
 ## Not upstreamed
 
 Deliberate, as of 2026-05-15. Observing locally first to confirm the patches
