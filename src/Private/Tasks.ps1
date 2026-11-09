@@ -44,15 +44,6 @@ function Start-PodeTaskHousekeeper {
                     # name not set yet. Skip; Items[$null] would null-deref.
                     if ($null -eq $process.Task) { continue }
 
-                    # get the task
-                    $task = $PodeContext.Tasks.Items[$process.Task]
-
-                    # [Orbital-Command patch] Items[$name] returns $null if
-                    # the task was removed (Clear-PodeTasks / Remove-PodeTask)
-                    # while one of its processes was still in flight. The
-                    # Failed branch below would null-deref $task.Retry.Max.
-                    if ($null -eq $task) { continue }
-
                     # [Orbital-Command patch] $process.Runspace is $null in two
                     # cases: (a) the brief window inside Invoke-PodeTaskInternal
                     # between inserting the process and assigning its runspace
@@ -70,6 +61,25 @@ function Start-PodeTaskHousekeeper {
                             Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
                                 $null = $PodeContext.Tasks.Processes.Remove($key)
                             }
+                        }
+                        continue
+                    }
+
+                    # get the task
+                    $task = $PodeContext.Tasks.Items[$process.Task]
+
+                    # [Orbital-Command patch] Items[$name] returns $null if
+                    # the task was removed (Clear-PodeTasks / Remove-PodeTask)
+                    # while one of its processes was still in flight. There is
+                    # no retention or retry policy left to apply, so close the
+                    # process as soon as it has finished, and keep enforcing its
+                    # timeout while it runs. (Skipping it, as before, kept the
+                    # pipeline and result buffer forever and dropped the timeout.)
+                    if ($null -eq $task) {
+                        $finished = $process.Runspace.Handler.IsCompleted -or ($process.State -iin @('Completed', 'Failed'))
+                        $expired = ($null -ne $process.ExpireTime) -and ($process.ExpireTime -lt $now)
+                        if ($finished -or $expired) {
+                            Close-PodeTaskInternal -Process $process
                         }
                         continue
                     }
