@@ -2,10 +2,12 @@
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
-via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Seven patches live here:
+via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Eight patches live here:
 four concurrency races in the task/schedule-pool plumbing, one Int32
-truncation in the IIS auth handler, and a real-cancel rework of the task
-teardown path (stop before dispose), and HTTP listener thread-pool starvation. Supply-Depot also consumes this fork. Everything else is unchanged upstream.
+truncation in the IIS auth handler, a real-cancel rework of the task
+teardown path (stop before dispose), HTTP listener thread-pool starvation,
+and a 2.14 custom-log-type regression. Supply-Depot also consumes this fork.
+Everything else is unchanged upstream.
 See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
 diagnosis.
 
@@ -43,7 +45,7 @@ diagnosis.
 - `git log v2.14.2..HEAD` shows our delta as discrete commits. The 2.13.4
   state is kept at tag `oc-patches-2.13.4` (`3db2e6ab`).
 
-## The seven patches
+## The eight patches
 
 ### 1. `src/Private/Tasks.ps1` — `Start-PodeTaskHousekeeper`
 
@@ -300,6 +302,30 @@ The complete Pode unit suite passes 1,949 tests with no failures; Pester reports
 one existing helper test as NotRun (1,950 discovered). Changed-file PSScriptAnalyzer is clean.
 Pool limits are changed only inside the test process. The fixture is PS7-only,
 matching the investigated environment; normal production APIs remain PS5-compatible.
+
+### 8. `src/Private/Logging.ps1` — `Add-PodeLogTypeInternal` default `-Version 1`
+
+New in 2.14.2, found while testing the 2.14.2 port. A custom log type added
+without `-Version` (which is how `Add-PodeLogger` / `Add-PodeLogType
+-ScriptBlock` is normally called, including Orbital-Command's and
+Supply-Depot's `csp` logger) never receives its `Write-PodeLog` item.
+
+`Add-PodeLogType` declares `$Version = 1` and forwards `@PSBoundParameters`
+to `Add-PodeLogTypeInternal`. `PSBoundParameters` never contains defaults,
+and the internal `[int]$Version` had none, so the type was stored with
+Version **0**. `Start-PodeLoggingRunspace` switches on 1 / 2 to build the
+scriptblock's arguments; with 0 neither branch runs, and the scriptblock is
+called with whatever `$_args` held from the previous log event: `$null`, or
+another log type's data (observed: a request-log `OrderedDictionary` written
+into the csp log). Measured on pristine upstream 2.14.2 with both the
+deprecated alias and the new `New-PodeLogFileMethod | Add-PodeLogType` API;
+`-Version 2` was unaffected. 2.13.4 passed the item correctly.
+
+Patch: `$Version = 1` on the internal parameter.
+`tests/unit/Logging.Tests.ps1` (`Add-PodeLogType`) pins Version 1 for an
+unset `-Version` (direct and via `Add-PodeLogger`) and an explicit 2; without
+the patch the two Version-1 tests fail with "Expected 1, but got 0".
+Not reported upstream yet. Worth an issue + PR.
 
 ## Upgrade procedure
 

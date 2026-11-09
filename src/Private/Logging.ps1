@@ -1568,10 +1568,16 @@ function Add-PodeLogTypeInternal {
         [object[]]
         $ArgumentList,
 
+        # [Orbital-Command patch 8] Default to 1, like Add-PodeLogType does.
+        # Add-PodeLogType forwards @PSBoundParameters, which never contains a
+        # parameter's default value, so an unset -Version arrived here as 0.
+        # The logging runspace's switch then matched neither 1 nor 2 and called
+        # the scriptblock with the previous log event's arguments ($null, or
+        # another log type's data) instead of the Write-PodeLog item.
         [Parameter(ParameterSetName = 'ScriptBlock')]
         [ValidateSet(1, 2)]
         [int]
-        $Version,
+        $Version = 1,
 
         [Parameter()]
         [Pode.Utilities.Logging.PodeLogFormat]

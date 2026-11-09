@@ -24,6 +24,33 @@ InModuleScope -ModuleName 'Pode' {
         }
     }
 
+    # [Orbital-Command patch 8] An unset -Version must be stored as 1, or the
+    # logging runspace never builds the scriptblock's arguments.
+    Describe 'Add-PodeLogType' {
+        BeforeEach {
+            Mock Test-PodeLogMethod { return $true }
+            Mock Register-PodeLogTypeToMethod {}
+            $logger = [pscustomobject]@{}
+            $logger | Add-Member -MemberType ScriptMethod -Name RegisterType -Value { param($type) }
+            $PodeContext = @{ Server = @{ Logging = @{ Types = @{}; Formatting = @{}; Logger = $logger } } }
+        }
+
+        It 'Stores Version 1 when -Version is not supplied' {
+            Add-PodeLogType -Name 'custom' -Method 'method-id' -ScriptBlock { param($item) $item }
+            $PodeContext.Server.Logging.Types['custom'].Version | Should -Be 1
+        }
+
+        It 'Keeps an explicit -Version 2' {
+            Add-PodeLogType -Name 'custom' -Method 'method-id' -Version 2 -ScriptBlock { param($logEvent) $logEvent }
+            $PodeContext.Server.Logging.Types['custom'].Version | Should -Be 2
+        }
+
+        It 'Stores Version 1 through the deprecated Add-PodeLogger alias' {
+            Add-PodeLogger -Name 'custom' -Method 'method-id' -ScriptBlock { param($item) $item }
+            $PodeContext.Server.Logging.Types['custom'].Version | Should -Be 1
+        }
+    }
+
     Describe 'Write-PodeLog' {
         BeforeEach {
             $PodeContext = @{
