@@ -47,9 +47,19 @@ function Start-PodeScheduleRunspace {
 
                     # [Orbital-Command patch] Half-constructed entry —
                     # $process.Runspace not yet assigned by Invoke-PodeInternalSchedule.
-                    # Skip; either transient (assignment imminent) or orphaned
-                    # (Add-PodeRunspace threw and left a half-built record).
-                    if ($null -eq $process.Runspace) { continue }
+                    # Either transient (assignment imminent: skip) or orphaned
+                    # (Add-PodeRunspace threw and left a half-built record, which
+                    # never gets a runspace). Sweep orphans once their timeout has
+                    # passed or 60s after creation, like the task housekeeper;
+                    # skipping them forever leaked the record.
+                    if ($null -eq $process.Runspace) {
+                        $orphanExpired = ($null -ne $process.ExpireTime) -and ($process.ExpireTime -lt $now)
+                        $orphanStale = ($null -ne $process.CreateTime) -and ($process.CreateTime.AddSeconds(60) -lt $now)
+                        if ($orphanExpired -or $orphanStale) {
+                            Close-PodeScheduleInternal -Process $process
+                        }
+                        continue
+                    }
 
                     # if it's completed or expired, dispose and remove
                     # [Orbital-Command patch] Null-check ExpireTime before
