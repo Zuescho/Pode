@@ -50,7 +50,7 @@ that empties `$PodeContext.Tasks.Processes`:
 |---|---|---|
 | a | `$process` can be `$null` between `Keys.Clone()` and `Processes[$key]` if another thread races `Close-PodeTaskInternal`. | Fixed upstream in 2.14.x — our copy dropped. |
 | b | `$process.Task` can be `$null` on a half-constructed entry inserted by `Invoke-PodeTaskInternal` (line 199) but not yet completed (line 226). | `if ($null -eq $process.Task) { continue }` |
-| c | `$task = $PodeContext.Tasks.Items[$process.Task]` can return `$null` if the task was removed mid-flight via `Clear-PodeTasks` / `Remove-PodeTask`. | `if ($null -eq $task) { continue }` |
+| c | `$task = $PodeContext.Tasks.Items[$process.Task]` can return `$null` if the task was removed mid-flight via `Clear-PodeTasks` / `Remove-PodeTask`. | No retention/retry policy is left, so close the process once it has finished, and keep enforcing its timeout while it runs. (Until the 2.14.2 port this was a bare `continue`, which kept such processes and their result buffers forever and dropped their timeout.) |
 | d | `$process.Runspace` is `$null` either transiently (the construction window) or permanently (if `Add-PodeRunspace` itself threw and left an orphan). Original code blows up on `$process.Runspace.Handler.IsCompleted`. | Skip transient; sweep entries with `Runspace=$null` more than 60 seconds past `CreateTime`. |
 | e | `$process.CompletedTime.AddMinutes(1)` throws if State is `Completed` but `CompletedTime` is `$null` (residual orphan state). Same shape for `ExpireTime`. | Null-check both before dereferencing. |
 
@@ -90,6 +90,31 @@ not in the 'Opened' state`.) Pode's normal `Open-PodeRunspacePool` flow at
 `Server.ps1:100` later replaces the lazy pool with the canonical one for
 that type, so this is genuinely a startup-window shim, not a permanent
 extra pool. `.Open()` is idempotent.
+
+Two additions from the 2.14.2 review (both bugs existed on 2.13.4 too):
+
+- **Restart.** `Restart-PodeServer` closes and disposes the pools but keeps
+  the wrappers, then re-runs the server scriptblock before
+  `New-PodeRunspacePool`. The old `$null` check didn't fire, so every
+  `Invoke-PodeTask` from the scriptblock failed with "runspace pool is not
+  in the 'Opened' state. The current state is 'Closed'" (Orbital-Command's
+  startup AD pre-warm, after each in-process restart). A wrapper whose pool
+  is disposed / Closed / Closing / Broken is now treated as missing. A
+  canonical pool that is merely not opened yet (`BeforeOpen`) is left alone.
+- **Leak.** `New-PodeRunspacePool` replaces the lazy wrapper and drops the
+  pool. Lazy pools are now recorded in `$PodeContext.Server.LazyRunspacePools`
+  and `Close-PodeRunspacePool` disposes them (shutdown and restart). Before,
+  each restart leaked one more pool. Work already queued on a lazy pool
+  keeps running until then, so during the startup window the task
+  concurrency limit can briefly be exceeded, and those runspaces don't have
+  the modules auto-imported after the scriptblock ran (the pool clones the
+  session state when it's created). Reusing the lazy pool instead would
+  lose the auto-imported modules for every later task, which Orbital-Command
+  relies on (§15j).
+
+`tests/unit/LazyRunspacePool.Tests.ps1` pins: creation + record, replacing a
+disposed pool, leaving a `BeforeOpen` canonical pool alone, and disposal by
+`Close-PodeRunspacePool`.
 
 ### 4. `src/Private/Schedules.ps1` — `Start-PodeScheduleRunspace` housekeeper
 
