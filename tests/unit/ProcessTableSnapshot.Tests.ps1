@@ -92,5 +92,21 @@ InModuleScope -ModuleName 'Pode' {
             $errors | Should -Be 0
             @(Get-PodeScheduleProcess -Name 'fixed').Count | Should -Be 200
         }
+
+        # Lock-PodeObject -Return unrolls a one-entry snapshot to the bare
+        # process hashtable; foreach treats a hashtable as one item, so every
+        # filter must still return that process.
+        It 'returns the only process of a one-entry table through every filter' {
+            $one = { [hashtable]::Synchronized(@{ only = @{ ID = 'only'; Task = 'fixed'; Schedule = 'fixed'; State = 'Running' } }) }
+            $PodeContext = @{ Tasks = @{ Processes = & $one }; Schedules = @{ Processes = & $one } }
+
+            foreach ($get in @('Get-PodeTaskProcess', 'Get-PodeScheduleProcess')) {
+                @(& $get).Count | Should -Be 1
+                @(& $get -Name 'fixed').Count | Should -Be 1
+                @(& $get -Id 'only').Count | Should -Be 1
+                @(& $get -State 'Running').Count | Should -Be 1
+                (@(& $get -Name 'fixed'))[0].ID | Should -Be 'only'
+            }
+        }
     }
 }
