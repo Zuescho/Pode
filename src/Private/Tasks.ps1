@@ -19,15 +19,15 @@ function Start-PodeTaskHousekeeper {
             # get the current time
             $now = [datetime]::UtcNow
 
-            # [Orbital-Command patch #6] Snapshot UNDER the global lockable —
-            # a bare @(.Keys) still enumerates the live KeyCollection during
-            # the copy, so a concurrent lock-serialised Remove (cancel route /
-            # over-budget reaper Close-PodeTaskInternal) can throw "Collection
-            # was modified" and abort the whole housekeeper tick (a 20s
-            # enforcement slip). Every mutator of this table is now
-            # lock-serialised; the read must join them. (Keys.Clone() was the
-            # pre-#6 form; @(...) alone was #6 round 1 — still unlocked.)
-            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+            # [Orbital-Command patch #6] Snapshot the keys while holding the
+            # table's own lock. Processes is [hashtable]::Synchronized, so
+            # every add/remove takes this same SyncRoot; copying the keys under
+            # it means no writer can change the table mid-copy. Neither
+            # Keys.Clone() (in PowerShell that clones each key string while
+            # still enumerating the live KeyCollection) nor a bare @(.Keys)
+            # does that: a concurrent Remove (cancel route / timeout close)
+            # throws "Collection was modified" and aborts the whole tick.
+            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Tasks.Processes -Return -ScriptBlock {
                 @($PodeContext.Tasks.Processes.Keys)
             }
 
@@ -53,14 +53,8 @@ function Start-PodeTaskHousekeeper {
                     if ($null -eq $process.Runspace) {
                         if ($null -ne $process.CreateTime -and
                             $process.CreateTime.AddSeconds(60) -lt $now) {
-                            # [Orbital-Command patch #6] Serialise like
-                            # Close-PodeTaskInternal's Remove — with the
-                            # cancel route, a concurrent Close can mutate the
-                            # table at the same moment (Hashtable tolerates
-                            # only ONE writer).
-                            Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
-                                $null = $PodeContext.Tasks.Processes.Remove($key)
-                            }
+                            # Synchronized table: Remove is atomic on its own.
+                            $null = $PodeContext.Tasks.Processes.Remove($key)
                         }
                         continue
                     }
@@ -191,10 +185,10 @@ function Close-PodeTaskInternal {
     #      code on .NET Core, so the runner slot is lost until the call
     #      returns either way; what we're protecting is the housekeeper.
     #   b) With Close now callable from HTTP routes, two Closes can race each
-    #      other (route + housekeeper expiry) — serialise the Processes
-    #      mutation via the global lockable. Hashtable tolerates concurrent
-    #      readers with ONE writer; concurrent Removes are the same torn-state
-    #      family the housekeeper snapshot patch (#1) exists for.
+    #      other (route + housekeeper expiry). Since 2.14 the Processes table
+    #      is [hashtable]::Synchronized, so the Remove below is atomic and
+    #      readers that need a stable view snapshot under the table's own
+    #      lock (housekeeper, Get-PodeTaskProcess, shutdown drain).
     $pipeline = $null
     if (($null -ne $Process.Runspace) -and ($null -ne $Process.Runspace.Pipeline)) {
         $pipeline = $Process.Runspace.Pipeline
@@ -253,11 +247,9 @@ function Close-PodeTaskInternal {
     # log from exactly that.
     Close-PodeDisposable -Disposable $Process.Result
 
-    # remove the process (serialised — see header comment)
+    # remove the process
     if (!$Keep) {
-        Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
-            $null = $PodeContext.Tasks.Processes.Remove($Process.ID)
-        }
+        $null = $PodeContext.Tasks.Processes.Remove($Process.ID)
     }
 }
 
@@ -309,11 +301,9 @@ function Invoke-PodeTaskInternal {
         }
 
         # add task process
-        # [Orbital-Command patch #6] The table insert is serialised under the
-        # same global lockable as every Remove and the Get-PodeTaskProcess
-        # snapshot — a Hashtable tolerates concurrent READERS with one
-        # writer, but an unserialised add during a locked enumeration still
-        # tears. Build the entry first, hold the lock only for the insert.
+        # [Orbital-Command patch #6] Build the entry first and keep a direct
+        # reference to it, so the rest of this function never re-reads the
+        # table (a concurrent Close may already have removed the entry).
         $result = [System.Management.Automation.PSDataCollection[psobject]]::new()
         $processEntry = @{
             ID            = $processId
@@ -336,9 +326,7 @@ function Invoke-PodeTaskInternal {
             }
             State         = 'Pending'
         }
-        Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
-            $PodeContext.Tasks.Processes[$processId] = $processEntry
-        }
+        $PodeContext.Tasks.Processes[$processId] = $processEntry
 
         # start the task runspace
         # [Orbital-Command patch] Wrap Add-PodeRunspace + Runspace assignment
@@ -353,10 +341,8 @@ function Invoke-PodeTaskInternal {
             $processEntry.Runspace = $runspace
         }
         catch {
-            # roll back the orphaned entry (serialised like every Remove), then rethrow
-            Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
-                $null = $PodeContext.Tasks.Processes.Remove($processId)
-            }
+            # roll back the orphaned entry, then rethrow
+            $null = $PodeContext.Tasks.Processes.Remove($processId)
             throw
         }
 

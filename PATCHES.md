@@ -58,10 +58,13 @@ that empties `$PodeContext.Tasks.Processes`:
 | d | `$process.Runspace` is `$null` either transiently (the construction window) or permanently (if `Add-PodeRunspace` itself threw and left an orphan). Original code blows up on `$process.Runspace.Handler.IsCompleted`. | Skip transient; sweep entries with `Runspace=$null` more than 60 seconds past `CreateTime`. |
 | e | `$process.CompletedTime.AddMinutes(1)` throws if State is `Completed` but `CompletedTime` is `$null` (residual orphan state). Same shape for `ExpireTime`. | Null-check both before dereferencing. |
 
-Bonus fix: `$PodeContext.Tasks.Processes.Keys.Clone()` does NOT safely snapshot
-a synchronized hashtable on PowerShell 7 — calling `.Remove()` inside the
-loop throws "Collection was modified". Replaced with
-`@($PodeContext.Tasks.Processes.Keys)`, which does materialise a real array.
+Bonus fix: `$PodeContext.Tasks.Processes.Keys.Clone()` is not a snapshot.
+`KeyCollection` has no `Clone()`, so PowerShell's member enumeration clones
+each key string while walking the live collection; a concurrent writer makes
+it throw "Collection was modified" (measured on PS7: ~33,600 failures in
+3.5 s against one writer thread). Upstream restored exactly this form in
+#1782. Replaced with `@(...Keys)` copied while holding the table's own lock
+(see patch 6).
 
 ### 2. `src/Private/Tasks.ps1` — `Invoke-PodeTaskInternal`
 
@@ -227,15 +230,21 @@ while RUNNING — which Orbital-Command now does routinely (manifest
    this patch exists to prevent. A state probe on a mid-teardown pipeline
    can throw `ObjectDisposedException` — caught and treated as "someone
    else already stopped it".
-2. **Concurrent table mutation.** `Processes` is a plain hashtable — safe
-   for many readers plus ONE writer; concurrent `.Remove()` is the same
-   torn-state family patch #1 guards against. All three `Remove` paths are
-   serialised via `Lock-PodeObject -Object
-   $PodeContext.Threading.Lockables.Global`: Close's own Remove, and the
-   housekeeper's orphan-sweep Remove (Runspace-null branch).
-   `Get-PodeTaskProcess` additionally snapshots `.Values` (`@(...)`) —
-   direct enumeration races a concurrent Remove into "Collection was
-   modified" (the cancel route enumerates it per request).
+2. **Concurrent table access.** Since 2.14 (#1758) both `Tasks.Processes`
+   and `Schedules.Processes` are `[hashtable]::Synchronized`, so single
+   adds/removes are atomic and take the table's `SyncRoot`. Every reader
+   that walks a table copies it while holding that same lock
+   (`Lock-PodeObject -Object $PodeContext.Tasks.Processes` /
+   `...Schedules.Processes`): both housekeepers, the shutdown drain in
+   `Close-PodeRunspace`, `Get-PodeTaskProcess` and `Get-PodeScheduleProcess`
+   (the cancel route enumerates the task table per request). Writers need no
+   extra lock. On 2.13.4 (plain hashtables) all of this went through
+   `Lockables.Global`; on 2.14 that lock no longer excluded upstream's own
+   writers (e.g. schedule inserts), so it was retargeted.
+   `tests/unit/ProcessTableSnapshot.Tests.ps1` pins it: with a writer
+   runspace adding/removing entries, an unlocked copy fails (control), and
+   both getters return 0 errors. Against the Global-lock version the same
+   test sees hundreds to thousands of failures.
 
 Note: disposing `$Process.Result` in the abandoned branch is deliberate —
 a wedged pipeline that eventually resumes and writes to its output

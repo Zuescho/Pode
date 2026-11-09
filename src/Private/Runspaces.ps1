@@ -342,13 +342,13 @@ function Close-PodeRunspace {
                 })
 
             # dispose of schedule runspaces
-            # [Orbital-Command patch #6] @(Keys) under the global lockable
+            # [Orbital-Command patch #6] @(Keys) under the tables own lock
             # instead of Keys.Clone() — the shutdown drain can race a
             # housekeeper/Close Remove; a throw here is rethrown by the
             # enclosing catch and would abort the drain (skipping the
             # Runspaces reset below).
             if ($PodeContext.Schedules.Processes.Count -gt 0) {
-                $schedKeys = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+                $schedKeys = Lock-PodeObject -Object $PodeContext.Schedules.Processes -Return -ScriptBlock {
                     @($PodeContext.Schedules.Processes.Keys)
                 }
                 foreach ($key in $schedKeys) {
@@ -358,7 +358,7 @@ function Close-PodeRunspace {
 
             # dispose of task runspaces
             if ($PodeContext.Tasks.Processes.Count -gt 0) {
-                $taskKeys = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+                $taskKeys = Lock-PodeObject -Object $PodeContext.Tasks.Processes -Return -ScriptBlock {
                     @($PodeContext.Tasks.Processes.Keys)
                 }
                 foreach ($key in $taskKeys) {

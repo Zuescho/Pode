@@ -616,7 +616,12 @@ function Get-PodeScheduleProcess {
         $State = 'All'
     )
 
-    $processes = $PodeContext.Schedules.Processes.Values
+    # [Orbital-Command patch #6] Snapshot under the table's own lock, like
+    # Get-PodeTaskProcess: schedule runs are added and removed by other
+    # runspaces while this enumerates.
+    $processes = Lock-PodeObject -Object $PodeContext.Schedules.Processes -Return -ScriptBlock {
+        @($PodeContext.Schedules.Processes.Values)
+    }
 
     # filter processes by name
     if (($null -ne $Name) -and ($Name.Length -gt 0)) {

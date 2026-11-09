@@ -625,13 +625,12 @@ function Get-PodeTaskProcess {
         $State = 'All'
     )
 
-    # [Orbital-Command patch #6] Snapshot the live view UNDER the same global
-    # lockable the Removes use — a bare @(.Values) copy still enumerates the
-    # live ValueCollection during the copy itself, so a concurrent Remove
-    # (housekeeper / Close) can still throw "Collection was modified" inside
-    # the snapshot. Same family as the housekeeper's @(Keys) snapshot in
-    # patch #1, closed properly.
-    $processes = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+    # [Orbital-Command patch #6] Snapshot the values under the table's own
+    # lock (the synchronized table's writers take the same SyncRoot) — a bare
+    # .Values / @(.Values) enumerates the live ValueCollection, so a
+    # concurrent add or Remove (new task, housekeeper, Close) throws
+    # "Collection was modified".
+    $processes = Lock-PodeObject -Object $PodeContext.Tasks.Processes -Return -ScriptBlock {
         @($PodeContext.Tasks.Processes.Values)
     }
 

@@ -29,12 +29,11 @@ function Start-PodeScheduleRunspace {
 
             $now = [datetime]::UtcNow
 
-            # [Orbital-Command patch #6] Snapshot under the global lockable —
-            # see the Tasks.ps1 housekeeper for the enumerate-during-Remove
-            # rationale. Symmetry: keep the schedule table's read discipline
-            # matched to the task table's even though the new cancel paths
-            # only mutate the task table today.
-            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+            # [Orbital-Command patch #6] Snapshot the keys under the table's
+            # own lock — see the Tasks.ps1 housekeeper. Schedule runs are
+            # inserted by the schedule runspace while this timer runs, so the
+            # copy must exclude that writer too.
+            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Schedules.Processes -Return -ScriptBlock {
                 @($PodeContext.Schedules.Processes.Keys)
             }
 
