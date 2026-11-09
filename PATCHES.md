@@ -25,9 +25,13 @@ diagnosis.
     dropped.
   - Upstream added task retention periods (#1783). The Completed branch keeps
     our `CompletedTime` null check but uses `$task.Retention.Completed`
-    instead of the fixed 1 minute; the Failed branch gets the same null
-    check (a Failed process without `CompletedTime` is closed right away
-    instead of throwing every tick).
+    instead of the fixed 1 minute. The Failed branch gets a null check too.
+    The task body sets `State = 'Failed'` in its catch, logs, and stamps
+    `CompletedTime` only in its finally, so a tick can land in between.
+    The housekeeper then starts the retention itself (stamps `CompletedTime`)
+    instead of throwing on `AddMinutes($null)`. The first version closed
+    such a process at once, which skipped the retention; an injected
+    process in that state was gone after one tick then and is kept now.
   - Patch 7's test fixture follows `PodeItemQueue` to
     `src/Listener/Utilities/Structures/` (`Pode.Utilities.Structures`).
   - `src/Libs/` is the PSGallery 2.14.2 `Libs`, byte-identical to the Libs in

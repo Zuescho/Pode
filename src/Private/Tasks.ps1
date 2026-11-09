@@ -106,12 +106,19 @@ function Start-PodeTaskHousekeeper {
                     if ($process.State -ieq 'Failed') {
                         # if we have hit the max retries, then close and remove
                         if ($process.Retry.Count -ge $task.Retry.Max) {
-                            # [Orbital-Command patch] A Failed process without a
-                            # CompletedTime would throw here on every tick and never
-                            # be removed; close it right away instead (the pre-2.14.1
-                            # behaviour for failed processes).
-                            if (($null -eq $process.CompletedTime) -or
-                                ($process.CompletedTime.AddMinutes($task.Retention.Failed) -lt $now)) {
+                            # [Orbital-Command patch] A Failed process can be seen
+                            # without a CompletedTime: the task body sets State in its
+                            # catch, logs, and stamps CompletedTime only in its finally.
+                            # AddMinutes on $null would throw on every tick. Start the
+                            # retention now instead (the finally overwrites the stamp a
+                            # moment later); closing at once would skip the retention
+                            # whenever a tick lands in that window.
+                            if ($null -eq $process.CompletedTime) {
+                                $process.CompletedTime = $now
+                                continue
+                            }
+
+                            if ($process.CompletedTime.AddMinutes($task.Retention.Failed) -lt $now) {
                                 Close-PodeTaskInternal -Process $process
                             }
 
