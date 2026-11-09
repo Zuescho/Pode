@@ -8,6 +8,8 @@ function Start-PodeTaskHousekeeper {
     }
 
     Add-PodeTimer -Name '__pode_task_housekeeper__' -Interval 20 -ScriptBlock {
+        # [Orbital-Command patch] Five concurrency fixes vs. upstream 2.13.2.
+        # See PATCHES.md at the repo root and plan §15d in Orbital-Command.
         try {
             # return if no task processes
             if ($PodeContext.Tasks.Processes.Count -eq 0) {
@@ -17,8 +19,20 @@ function Start-PodeTaskHousekeeper {
             # get the current time
             $now = [datetime]::UtcNow
 
+            # [Orbital-Command patch #6] Snapshot UNDER the global lockable —
+            # a bare @(.Keys) still enumerates the live KeyCollection during
+            # the copy, so a concurrent lock-serialised Remove (cancel route /
+            # over-budget reaper Close-PodeTaskInternal) can throw "Collection
+            # was modified" and abort the whole housekeeper tick (a 20s
+            # enforcement slip). Every mutator of this table is now
+            # lock-serialised; the read must join them. (Keys.Clone() was the
+            # pre-#6 form; @(...) alone was #6 round 1 — still unlocked.)
+            $keysSnapshot = Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -Return -ScriptBlock {
+                @($PodeContext.Tasks.Processes.Keys)
+            }
+
             # loop through each process
-            foreach ($key in $PodeContext.Tasks.Processes.Keys.Clone()) {
+            foreach ($key in $keysSnapshot) {
                 try {
                     # get the process
                     $process = $PodeContext.Tasks.Processes[$key]
@@ -26,8 +40,39 @@ function Start-PodeTaskHousekeeper {
                         continue
                     }
 
+                    # [Orbital-Command patch] Half-constructed entry — Task
+                    # name not set yet. Skip; Items[$null] would null-deref.
+                    if ($null -eq $process.Task) { continue }
+
                     # get the task
                     $task = $PodeContext.Tasks.Items[$process.Task]
+
+                    # [Orbital-Command patch] Items[$name] returns $null if
+                    # the task was removed (Clear-PodeTasks / Remove-PodeTask)
+                    # while one of its processes was still in flight. The
+                    # Failed branch below would null-deref $task.Retry.Max.
+                    if ($null -eq $task) { continue }
+
+                    # [Orbital-Command patch] $process.Runspace is $null in two
+                    # cases: (a) the brief window inside Invoke-PodeTaskInternal
+                    # between inserting the process and assigning its runspace
+                    # (transient — skip and let the next pass see it), or
+                    # (b) Add-PodeRunspace itself threw and left an orphan
+                    # (permanent — sweep after 60s).
+                    if ($null -eq $process.Runspace) {
+                        if ($null -ne $process.CreateTime -and
+                            $process.CreateTime.AddSeconds(60) -lt $now) {
+                            # [Orbital-Command patch #6] Serialise like
+                            # Close-PodeTaskInternal's Remove — with the
+                            # cancel route, a concurrent Close can mutate the
+                            # table at the same moment (Hashtable tolerates
+                            # only ONE writer).
+                            Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+                                $null = $PodeContext.Tasks.Processes.Remove($key)
+                            }
+                        }
+                        continue
+                    }
 
                     # if completed, and no completed time set, then set one and continue
                     if ($process.Runspace.Handler.IsCompleted -and ($null -eq $process.CompletedTime)) {
@@ -37,7 +82,12 @@ function Start-PodeTaskHousekeeper {
                     }
 
                     # if the process is completed, then close and remove
-                    if (($process.State -ieq 'Completed') -and ($process.CompletedTime.AddMinutes($task.Retention.Completed) -lt $now)) {
+                    # [Orbital-Command patch] Null-check CompletedTime before
+                    # AddMinutes — State='Completed' without CompletedTime
+                    # shouldn't normally happen but does for residual orphans.
+                    if (($process.State -ieq 'Completed') -and `
+                        ($null -ne $process.CompletedTime) -and `
+                        ($process.CompletedTime.AddMinutes($task.Retention.Completed) -lt $now)) {
                         Close-PodeTaskInternal -Process $process
                         continue
                     }
@@ -46,7 +96,12 @@ function Start-PodeTaskHousekeeper {
                     if ($process.State -ieq 'Failed') {
                         # if we have hit the max retries, then close and remove
                         if ($process.Retry.Count -ge $task.Retry.Max) {
-                            if ($process.CompletedTime.AddMinutes($task.Retention.Failed) -lt $now) {
+                            # [Orbital-Command patch] A Failed process without a
+                            # CompletedTime would throw here on every tick and never
+                            # be removed; close it right away instead (the pre-2.14.1
+                            # behaviour for failed processes).
+                            if (($null -eq $process.CompletedTime) -or
+                                ($process.CompletedTime.AddMinutes($task.Retention.Failed) -lt $now)) {
                                 Close-PodeTaskInternal -Process $process
                             }
 
@@ -69,7 +124,9 @@ function Start-PodeTaskHousekeeper {
                     }
 
                     # if the process is running, and the expire time has passed, then close and remove
-                    if ($process.ExpireTime -lt $now) {
+                    # [Orbital-Command patch] Null-check ExpireTime symmetric
+                    # to CompletedTime above.
+                    if ($null -ne $process.ExpireTime -and $process.ExpireTime -lt $now) {
                         Close-PodeTaskInternal -Process $process
                         continue
                     }
@@ -102,13 +159,88 @@ function Close-PodeTaskInternal {
         return
     }
 
-    # close the runspace
-    Close-PodeDisposable -Disposable $Process.Runspace.Pipeline
+    # [Orbital-Command patch #6] Real cancel + guarded teardown.
+    #
+    # Stock Pode only calls Close-PodeDisposable → Dispose() here. Two
+    # problems with that once tasks are closed while RUNNING (timeout expiry
+    # or an explicit Close-PodeTask):
+    #   a) PowerShell.Dispose() on a running pipeline performs a SYNCHRONOUS
+    #      Stop() — a pipeline wedged inside a blocking native call (hung
+    #      LDAP/WinRM) can therefore hang the housekeeper thread, and with it
+    #      every future timeout enforcement. BeginStop() never blocks; give
+    #      the pipeline a short window to reach a stopped state and only then
+    #      dispose. If it won't stop, abandon the object to the GC finalizer
+    #      and log loudly — there is no way to abort a thread stuck in native
+    #      code on .NET Core, so the runner slot is lost until the call
+    #      returns either way; what we're protecting is the housekeeper.
+    #   b) With Close now callable from HTTP routes, two Closes can race each
+    #      other (route + housekeeper expiry) — serialise the Processes
+    #      mutation via the global lockable. Hashtable tolerates concurrent
+    #      readers with ONE writer; concurrent Removes are the same torn-state
+    #      family the housekeeper snapshot patch (#1) exists for.
+    $pipeline = $null
+    if (($null -ne $Process.Runspace) -and ($null -ne $Process.Runspace.Pipeline)) {
+        $pipeline = $Process.Runspace.Pipeline
+    }
+
+    if ($null -ne $pipeline) {
+        # 'Stopping' must be treated exactly like 'Running' (both in the
+        # entry check and the poll): a pipeline enters Stopping the instant
+        # BeginStop is requested — including by a CONCURRENT Close (the
+        # cancel route racing the housekeeper's expiry close). Treating
+        # Stopping as "already stopped" would dispose immediately, and
+        # PowerShell.Dispose() on a not-yet-stopped pipeline performs a
+        # SYNCHRONOUS Stop() — the indefinite hang this patch exists to
+        # prevent.
+        $liveStates = @(
+            [System.Management.Automation.PSInvocationState]::Running,
+            [System.Management.Automation.PSInvocationState]::Stopping
+        )
+        $stopped = $true
+        try {
+            if ($pipeline.InvocationStateInfo.State -in $liveStates) {
+                $stopped = $false
+                try { $null = $pipeline.BeginStop($null, $null) } catch { }
+                $deadline = [datetime]::UtcNow.AddSeconds(3)
+                while ([datetime]::UtcNow -lt $deadline) {
+                    if ($pipeline.InvocationStateInfo.State -notin $liveStates) {
+                        $stopped = $true
+                        break
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+        }
+        catch {
+            # reading InvocationStateInfo on a mid-teardown pipeline can throw
+            # ObjectDisposedException — another Close got here first; nothing
+            # left for us to stop.
+            $stopped = $true
+        }
+
+        if ($stopped) {
+            Close-PodeDisposable -Disposable $pipeline
+        }
+        else {
+            try {
+                [System.Exception]::new("Task process '$($Process.ID)' ($($Process.Task)) did not stop within 3s of BeginStop - pipeline abandoned to the GC finalizer; its task-pool slot stays busy until the blocking call returns.") | Write-PodeErrorLog
+            } catch { }
+        }
+    }
+
+    # NB: disposing Result here even in the abandoned branch is deliberate —
+    # a wedged pipeline that eventually resumes and writes to its output
+    # collection throws into the (already dead) task body, which helps kill
+    # it; the run row is reconciled by Orbital-Command's over-budget sweep
+    # either way. Expect an occasional ObjectDisposedException in the error
+    # log from exactly that.
     Close-PodeDisposable -Disposable $Process.Result
 
-    # remove the process
+    # remove the process (serialised — see header comment)
     if (!$Keep) {
-        $null = $PodeContext.Tasks.Processes.Remove($Process.ID)
+        Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+            $null = $PodeContext.Tasks.Processes.Remove($Process.ID)
+        }
     }
 }
 
@@ -160,8 +292,13 @@ function Invoke-PodeTaskInternal {
         }
 
         # add task process
+        # [Orbital-Command patch #6] The table insert is serialised under the
+        # same global lockable as every Remove and the Get-PodeTaskProcess
+        # snapshot — a Hashtable tolerates concurrent READERS with one
+        # writer, but an unserialised add during a locked enumeration still
+        # tears. Build the entry first, hold the lock only for the insert.
         $result = [System.Management.Automation.PSDataCollection[psobject]]::new()
-        $PodeContext.Tasks.Processes[$processId] = @{
+        $processEntry = @{
             ID            = $processId
             Task          = $Task.Name
             Parameters    = $parameters
@@ -182,16 +319,32 @@ function Invoke-PodeTaskInternal {
             }
             State         = 'Pending'
         }
+        Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+            $PodeContext.Tasks.Processes[$processId] = $processEntry
+        }
 
         # start the task runspace
+        # [Orbital-Command patch] Wrap Add-PodeRunspace + Runspace assignment
+        # in a nested try so a failure here rolls back the half-constructed
+        # Processes[$processId] entry. Without this, an exception leaves an
+        # orphan with Runspace=$null that the housekeeper has to sweep.
         $scriptblock = Get-PodeTaskScriptBlock
-        $runspace = Add-PodeRunspace -Type Tasks -Name $Task.Name -ScriptBlock $scriptblock -Parameters $parameters -OutputStream $result -PassThru
+        try {
+            $runspace = Add-PodeRunspace -Type Tasks -Name $Task.Name -ScriptBlock $scriptblock -Parameters $parameters -OutputStream $result -PassThru
 
-        # add runspace to process
-        $PodeContext.Tasks.Processes[$processId].Runspace = $runspace
+            # add runspace to process
+            $processEntry.Runspace = $runspace
+        }
+        catch {
+            # roll back the orphaned entry (serialised like every Remove), then rethrow
+            Lock-PodeObject -Object $PodeContext.Threading.Lockables.Global -ScriptBlock {
+                $null = $PodeContext.Tasks.Processes.Remove($processId)
+            }
+            throw
+        }
 
         # return the task process
-        return $PodeContext.Tasks.Processes[$processId]
+        return $processEntry
     }
     catch {
         $_ | Write-PodeErrorLog
@@ -337,7 +490,13 @@ function Get-PodeTaskScriptBlock {
             $_ | Write-PodeErrorLog
         }
         finally {
-            $process.CompletedTime = [datetime]::UtcNow
+            # [Orbital-Command patch #6] Null-guard: when the process entry
+            # was removed before start (a cancelled queued task whose
+            # abandoned pipeline later got a pool slot), the throw above
+            # leaves $process = $null — the catch guards it, this didn't.
+            if ($null -ne $process) {
+                $process.CompletedTime = [datetime]::UtcNow
+            }
             Reset-PodeRunspaceName
             Invoke-PodeGC
         }
