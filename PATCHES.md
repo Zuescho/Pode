@@ -97,8 +97,11 @@ Two additions from the 2.14.2 review (both bugs existed on 2.13.4 too):
   the wrappers, then re-runs the server scriptblock before
   `New-PodeRunspacePool`. The old `$null` check didn't fire, so every
   `Invoke-PodeTask` from the scriptblock failed with "runspace pool is not
-  in the 'Opened' state. The current state is 'Closed'" (Orbital-Command's
-  startup AD pre-warm, after each in-process restart). A wrapper whose pool
+  in the 'Opened' state. The current state is 'Closed'". As of 2026-11-09
+  neither consumer invokes a task from its server scriptblock any more
+  (Orbital-Command dropped its AD pre-warm; Supply-Depot only dispatches from
+  routes and schedules), so this path is dormant in both: the fix keeps the
+  patch correct for when one does. A wrapper whose pool
   is disposed / Closed / Closing / Broken is now treated as missing. A
   canonical pool that is merely not opened yet (`BeforeOpen`) is left alone.
 - **Leak.** `New-PodeRunspacePool` replaces the lazy wrapper and drops the
@@ -125,6 +128,13 @@ Mirror the task-housekeeper patch: `@(Keys)` snapshot, null-checks for
 `$process` / `$process.Runspace` / `$process.ExpireTime` before
 dereferencing. Same surfaced symptom (`You cannot call a method on a
 null-valued expression`), same fix shape.
+
+A record whose `Runspace` is still `$null` is swept once its `ExpireTime`
+has passed or 60 s after `CreateTime` (an orphan: `Add-PodeRunspace` threw
+inside `Invoke-PodeInternalSchedule`, so it never gets a runspace). Until the
+2.14.2 review it was skipped forever, a leak upstream's own expiry check
+didn't have. Probe: an injected orphan stays in the table on 2.13.4 and is
+gone after one housekeeper tick with the fix.
 
 ### 5. `src/Private/Authentication.ps1` — `Get-PodeAuthWindowsADIISMethod`
 
