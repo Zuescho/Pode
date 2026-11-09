@@ -847,6 +847,19 @@ function Close-PodeRunspacePool {
         Close-PodeDisposable -Disposable $item.Pool
     }
 
+    # [Orbital-Command patch 3] dispose the pools Add-PodeRunspace created on
+    # demand during the server scriptblock; New-PodeRunspacePool replaced them
+    # in RunspacePools, so the loop above no longer sees them.
+    if ($null -ne $PodeContext.Server.LazyRunspacePools) {
+        foreach ($pool in @($PodeContext.Server.LazyRunspacePools)) {
+            if (($null -ne $pool) -and !$pool.IsDisposed) {
+                Close-PodeDisposable -Disposable $pool
+            }
+        }
+
+        $PodeContext.Server.LazyRunspacePools.Clear()
+    }
+
     Write-Verbose "RunspacePools closed [duration: $(([datetime]::Now - $start).TotalSeconds)s]"
 }
 

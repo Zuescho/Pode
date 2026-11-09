@@ -82,7 +82,17 @@ function Add-PodeRunspace {
         # have to know about Pode's startup ordering. The Pool will be
         # opened later by the normal Open-PodeRunspacePool flow; pipelines
         # queued in the meantime run as soon as that happens.
-        if ($null -eq $PodeContext.RunspacePools[$Type]) {
+        #
+        # After Restart-PodeServer the wrapper still exists but holds the pool
+        # Close-PodeRunspacePool closed and disposed, and the user scriptblock
+        # runs again before New-PodeRunspacePool: treat that like a missing
+        # wrapper, or every Invoke-PodeTask from the scriptblock fails with
+        # "the runspace pool is not in the 'Opened' state".
+        $wrapper = $PodeContext.RunspacePools[$Type]
+        $needsPool = ($null -eq $wrapper) -or ($null -eq $wrapper.Pool) -or $wrapper.Pool.IsDisposed -or
+            ("$($wrapper.Pool.RunspacePoolStateInfo.State)" -in @('Closed', 'Closing', 'Broken'))
+
+        if ($needsPool) {
             $threadCount = switch ($Type) {
                 'Tasks'      { $PodeContext.Threads.Tasks }
                 'Timers'     { $PodeContext.Threads.Timers }
@@ -109,6 +119,17 @@ function Add-PodeRunspace {
                 State  = 'Waiting'
                 LastId = 0
             }
+
+            # New-PodeRunspacePool later replaces this wrapper with the
+            # canonical pool (which also carries the auto-imported modules) and
+            # drops the reference to this one. Remember it, so
+            # Close-PodeRunspacePool disposes it on shutdown and restart instead
+            # of leaking one pool per restart. Work already queued on it keeps
+            # running until then.
+            if ($null -eq $PodeContext.Server.LazyRunspacePools) {
+                $PodeContext.Server.LazyRunspacePools = [System.Collections.Generic.List[object]]::new()
+            }
+            $PodeContext.Server.LazyRunspacePools.Add($pool)
         }
 
         # Define the script block to open the runspace and set its state.
