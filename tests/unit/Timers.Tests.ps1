@@ -194,4 +194,23 @@ InModuleScope -ModuleName 'Pode' {
             $PodeContext.Timers.Items['test1'].Script.ToString() | Should -Be ({ Write-Host 'hello2' }).ToString()
         }
     }
+
+    Describe 'Invoke-PodeTimer' {
+        It 'Runs the timer without forcing a full garbage collection' {
+            $PodeContext = @{
+                Server    = @{ Root = $PWD.Path }
+                Threading = @{ Lockables = @{ Global = [hashtable]::Synchronized(@{}) } }
+                Timers    = @{ Items = @{} }
+            }
+            $state = @{ Ticks = 0 }
+            Add-PodeTimer -Name 'tick' -Interval 1 -ScriptBlock { param($State) $State.Ticks++ }
+
+            $gen2Before = [System.GC]::CollectionCount(2)
+            1..3 | ForEach-Object { Invoke-PodeTimer -Name 'tick' -ArgumentList @(, $state) }
+            $gen2After = [System.GC]::CollectionCount(2)
+
+            $state.Ticks | Should -Be 3
+            ($gen2After - $gen2Before) | Should -BeLessThan 3
+        }
+    }
 }

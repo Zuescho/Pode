@@ -2,11 +2,12 @@
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
-via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Eight patches live here:
+via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Nine patches live here:
 four concurrency races in the task/schedule-pool plumbing, one Int32
 truncation in the IIS auth handler, a real-cancel rework of the task
 teardown path (stop before dispose), HTTP listener thread-pool starvation,
-and a 2.14 custom-log-type regression. Supply-Depot also consumes this fork.
+a 2.14 custom-log-type regression, and the forced garbage collection after
+every timer tick. Supply-Depot also consumes this fork.
 Everything else is unchanged upstream.
 See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
 diagnosis.
@@ -45,7 +46,7 @@ diagnosis.
 - `git log v2.14.2..HEAD` shows our delta as discrete commits. The 2.13.4
   state is kept at tag `oc-patches-2.13.4` (`3db2e6ab`).
 
-## The eight patches
+## The nine patches
 
 ### 1. `src/Private/Tasks.ps1` — `Start-PodeTaskHousekeeper`
 
@@ -326,6 +327,43 @@ Patch: `$Version = 1` on the internal parameter.
 unset `-Version` (direct and via `Add-PodeLogger`) and an explicit 2; without
 the patch the two Version-1 tests fail with "Expected 1, but got 0".
 Not reported upstream yet. Worth an issue + PR.
+
+### 9. `src/Private/Timers.ps1` — `Invoke-PodeInternalTimer` without a forced collection
+
+Upstream ends every timer run (each tick, and `Invoke-PodeTimer`) with
+`finally { Invoke-PodeGC }`, which is `[System.GC]::Collect()`: a blocking,
+compacting gen2 collection that suspends every managed thread, request
+workers included. Pode's own housekeepers are timers: cache (10 s), task
+(20 s, once a task is defined) and schedule (30 s, once a schedule is
+defined). Neither app adds a timer of its own, so these are the only timers
+in both, and they mostly return at once.
+
+The patch drops that `finally`; the timer body and its error logging are
+unchanged. The collections at the end of a schedule run
+(`Get-PodeScheduleScriptBlock`), a task run (`Get-PodeTaskScriptBlock`) and in
+`Close-PodeRunspace` (shutdown, restart) stay. Without the forced ones the
+runtime collects on its own; in pwsh (workstation GC, concurrent) gen2 then
+runs as a background collection.
+
+Measured on a Supply-Depot side server with a production-sized database
+(~1 GB managed heap from the start: every runspace imports the app's
+modules), under steady list reads: each forced collection paused the process
+0.5-2.0 s (median 0.6-1.1 s). In 5 minutes there were 43 induced gen2
+collections, one per timer tick (28 + 15), all on the timer runspace's thread;
+37 of 38 `/api/health` stalls over 150 ms overlapped one. Side by side for
+80 minutes, `/api/health` every 250 ms: unpatched 732 stalls, p99 0.7-1.2 s;
+patched 56 stalls, p99 30-64 ms (the 40 forced collections left came from task
+runs). Private bytes after 80 minutes: 1,500 MB unpatched, 1,501 MB patched,
+1,511 MB with no forced collection anywhere; the patched server stayed between
+1,336 and 1,503 MB from minute 30 on.
+
+`tests/unit/Timers.Tests.ps1` (`Invoke-PodeTimer`) ticks a timer three times
+and expects fewer than three gen2 collections; upstream's code fails it with
+exactly three. Not reported upstream yet.
+
+On the next upstream upgrade: `Invoke-PodeInternalTimer` must still have no
+`Invoke-PodeGC`; check for new internal timers
+(`Add-PodeTimer -Name '__pode_`) and new `Invoke-PodeGC` call sites.
 
 ## Upgrade procedure
 
