@@ -196,7 +196,7 @@ InModuleScope -ModuleName 'Pode' {
     }
 
     Describe 'Invoke-PodeTimer' {
-        It 'Runs the timer without forcing a full garbage collection' {
+        It 'Runs the timer without forcing a full garbage collection' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
             $PodeContext = @{
                 Server    = @{ Root = $PWD.Path }
                 Threading = @{ Lockables = @{ Global = [hashtable]::Synchronized(@{}) } }
@@ -205,12 +205,19 @@ InModuleScope -ModuleName 'Pode' {
             $state = @{ Ticks = 0 }
             Add-PodeTimer -Name 'tick' -Interval 1 -ScriptBlock { param($State) $State.Ticks++ }
 
-            $gen2Before = [System.GC]::CollectionCount(2)
-            1..3 | ForEach-Object { Invoke-PodeTimer -Name 'tick' -ArgumentList @(, $state) }
-            $gen2After = [System.GC]::CollectionCount(2)
+            # [GC]::Collect() is a full blocking collection; the runtime's own gen2 runs in the
+            # background, and one blocking collection of its own may still land in a tick
+            $blockingTicks = 0
+            foreach ($i in 1..10) {
+                $lastBlocking = [System.GC]::GetGCMemoryInfo([System.GCKind]::FullBlocking).Index
+                Invoke-PodeTimer -Name 'tick' -ArgumentList @(, $state)
+                if ([System.GC]::GetGCMemoryInfo([System.GCKind]::FullBlocking).Index -ne $lastBlocking) {
+                    $blockingTicks++
+                }
+            }
 
-            $state.Ticks | Should -Be 3
-            ($gen2After - $gen2Before) | Should -BeLessThan 3
+            $state.Ticks | Should -Be 10
+            $blockingTicks | Should -BeLessOrEqual 1
         }
     }
 }

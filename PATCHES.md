@@ -331,39 +331,81 @@ Not reported upstream yet. Worth an issue + PR.
 ### 9. `src/Private/Timers.ps1` — `Invoke-PodeInternalTimer` without a forced collection
 
 Upstream ends every timer run (each tick, and `Invoke-PodeTimer`) with
-`finally { Invoke-PodeGC }`, which is `[System.GC]::Collect()`: a blocking,
-compacting gen2 collection that suspends every managed thread, request
-workers included. Pode's own housekeepers are timers: cache (10 s), task
-(20 s, once a task is defined) and schedule (30 s, once a schedule is
-defined). Neither app adds a timer of its own, so these are the only timers
-in both, and they mostly return at once.
+`finally { Invoke-PodeGC }`, which is `[System.GC]::Collect()`: a blocking
+gen2 collection that suspends every managed thread, request workers
+included. Pode's own housekeepers are timers: cache (10 s), task (20 s, once
+a task is defined) and schedule (30 s, once a schedule is defined). Neither
+app adds a timer of its own, so these are the only timers in both. With all
+three running that is about 11 forced collections a minute, idle or not.
 
 The patch drops that `finally`; the timer body and its error logging are
-unchanged. The collections at the end of a schedule run
-(`Get-PodeScheduleScriptBlock`), a task run (`Get-PodeTaskScriptBlock`) and in
-`Close-PodeRunspace` (shutdown, restart) stay. Without the forced ones the
-runtime collects on its own; in pwsh (workstation GC, concurrent) gen2 then
-runs as a background collection.
+unchanged. That removes the timer-tick collections and nothing else. Still
+forced:
+
+- At the end of every schedule run (`Get-PodeScheduleScriptBlock`) and every
+  task run (`Get-PodeTaskScriptBlock`), and in `Close-PodeRunspace`
+  (shutdown, restart).
+- Supply-Depot: a schedule tick dispatches a `run-script` task
+  (`Platform-Core/11a-Schedules.ps1`, `Invoke-PlatformScheduleTrigger`), so
+  one tick is two collections. `Send-Webhooks` ships with `*/5 * * * *`,
+  enabled, which makes about 24 an hour; the AD syncs, nightly jobs and every
+  manual script run add to that.
+- Orbital-Command: `over-budget-run-reaper` (`server.ps1`, `*/5 * * * *`) is
+  registered even when automation is paused, so at least 12 an hour on an idle
+  server; each configured script schedule adds two per tick. Every
+  `Invoke-AdReadInFreshRunspace` (`Platform-Core/09-AdComputerFields-AdReads.ps1`)
+  runs one `ad-read` task. Its `finally` collects before `Wait-PodeTask`
+  returns, so each interactive AD read (the user, group and computer
+  `/fresh` reads, quick actions and others) pauses every request and makes
+  its own caller wait for the collection.
 
 Measured on a Supply-Depot side server with a production-sized database
 (~1 GB managed heap from the start: every runspace imports the app's
-modules), under steady list reads: each forced collection paused the process
-0.5-2.0 s (median 0.6-1.1 s). In 5 minutes there were 43 induced gen2
-collections, one per timer tick (28 + 15), all on the timer runspace's thread;
-37 of 38 `/api/health` stalls over 150 ms overlapped one. Side by side for
-80 minutes, `/api/health` every 250 ms: unpatched 732 stalls, p99 0.7-1.2 s;
-patched 56 stalls, p99 30-64 ms (the 40 forced collections left came from task
-runs). Private bytes after 80 minutes: 1,500 MB unpatched, 1,501 MB patched,
-1,511 MB with no forced collection anywhere; the patched server stayed between
-1,336 and 1,503 MB from minute 30 on.
+modules), with `SD_SUPPRESS_SCHEDULES=1`, so no schedule ran and the cron
+collections above were not measured. Under steady list reads each forced
+collection paused the process 0.5-2.0 s (median 0.6-1.1 s). In 5 minutes
+there were 43 induced gen2 collections, one per timer tick (28 + 15), all on
+the timer runspace's thread; 37 of 38 `/api/health` stalls over 150 ms
+overlapped one.
 
-`tests/unit/Timers.Tests.ps1` (`Invoke-PodeTimer`) ticks a timer three times
-and expects fewer than three gen2 collections; upstream's code fails it with
-exactly three. Not reported upstream yet.
+Three servers then ran side by side through two consecutive windows of 30 and
+50 minutes (80 minutes), `/api/health` every 250 ms: unpatched, patched, and a
+copy with no forced collection anywhere. Results:
 
-On the next upstream upgrade: `Invoke-PodeInternalTimer` must still have no
-`Invoke-PodeGC`; check for new internal timers
-(`Add-PodeTimer -Name '__pode_`) and new `Invoke-PodeGC` call sites.
+- Stalls: unpatched 732, p99 0.7-1.2 s; patched 56, p99 30-64 ms. The 40
+  forced collections left on the patched server came from the load script's
+  task run every 2 minutes.
+- Gen2 process counters: patched 80 (40 of them those forced ones); no-forced
+  copy 55. The event probe recorded the forced ones and, on the no-forced
+  copy, two others. The runtime's total-pause counter equals the recorded
+  pauses within a second, so the rest of the runtime's own gen2 collections
+  ran in the background.
+  A blocking full collection the runtime starts itself still happens now and
+  then: one of 2,537 ms (allocation-triggered) on the no-forced copy, and one
+  of 2,337 ms (low-memory reason) in a separate idle run of this patch. The
+  unpatched server had low-memory ones too.
+- Private bytes after 80 minutes: 1,500 MB unpatched, 1,501 MB patched,
+  1,511 MB with no forced collection; the patched server stayed between 1,336
+  and 1,503 MB from minute 30 on.
+
+`tests/unit/Timers.Tests.ps1` (`Invoke-PodeTimer`) ticks a timer ten times
+and counts the ticks during which a full blocking collection happened
+(`GC.GetGCMemoryInfo(GCKind.FullBlocking).Index`). It allows one, for a
+blocking collection the runtime starts itself. The runtime's own gen2 runs in
+the background, so a gen2 count would also include unrelated collections.
+Upstream's code fails it with 10; a version that collects on every other tick
+fails with 5. It passed 10 runs alone and 10 runs beside a thread allocating
+64 MB arrays (110-210 background gen2 per run). PS7 only (`GCKind` is .NET 5+),
+skipped on Windows PowerShell like patch 7's fixture. Not reported upstream
+yet.
+
+On the next upstream upgrade, check that:
+
+- `Invoke-PodeInternalTimer` still has no `Invoke-PodeGC` and no direct
+  `[System.GC]::Collect` (`Timers.Tests.ps1` pins it).
+- No new internal timer has appeared (`Add-PodeTimer -Name '__pode_`).
+- No new collection call site has appeared (`Invoke-PodeGC`,
+  `[System.GC]::Collect`, `[GC]::Collect` under `src/`).
 
 ## Upgrade procedure
 
