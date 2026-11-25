@@ -2,12 +2,13 @@
 
 This fork is consumed by the Orbital-Command platform
 (`C:\Users\d150111\Documents\Git\Orbital-Command`), imported in `server.ps1`
-via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Nine patches live here:
+via `Import-Module ..\Pode\src\Pode.psd1 -Force`. Ten patches live here:
 four concurrency races in the task/schedule-pool plumbing, one Int32
 truncation in the IIS auth handler, a real-cancel rework of the task
 teardown path (stop before dispose), HTTP listener thread-pool starvation,
-a 2.14 custom-log-type regression, and the forced garbage collection after
-every timer tick. Supply-Depot also consumes this fork.
+a 2.14 custom-log-type regression, and the forced garbage collections after
+every timer tick (9) and after every task and schedule run (10).
+Supply-Depot also consumes this fork.
 Everything else is unchanged upstream, apart from the build-script default
 under "Build and CI".
 See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
@@ -47,7 +48,7 @@ diagnosis.
 - `git log v2.14.2..HEAD` shows our delta as discrete commits. The 2.13.4
   state is kept at tag `oc-patches-2.13.4` (`3db2e6ab`).
 
-## The nine patches
+## The ten patches
 
 ### 1. `src/Private/Tasks.ps1` — `Start-PodeTaskHousekeeper`
 
@@ -340,8 +341,9 @@ app adds a timer of its own, so these are the only timers in both. With all
 three running that is about 11 forced collections a minute, idle or not.
 
 The patch drops that `finally`; the timer body and its error logging are
-unchanged. That removes the timer-tick collections and nothing else. Still
-forced:
+unchanged. That removes the timer-tick collections and nothing else. With
+patch 9 alone these stay forced; patch 10 removes all of them except the one
+in `Close-PodeRunspace`:
 
 - At the end of every schedule run (`Get-PodeScheduleScriptBlock`) and every
   task run (`Get-PodeTaskScriptBlock`), and in `Close-PodeRunspace`
@@ -407,6 +409,163 @@ On the next upstream upgrade, check that:
 - No new internal timer has appeared (`Add-PodeTimer -Name '__pode_`).
 - No new collection call site has appeared (`Invoke-PodeGC`,
   `[System.GC]::Collect`, `[GC]::Collect` under `src/`).
+
+### 10. `src/Private/Tasks.ps1` / `src/Private/Schedules.ps1` — no forced collection after a task or schedule run
+
+Upstream ends every task run (`Get-PodeTaskScriptBlock`) and every schedule
+run (`Get-PodeScheduleScriptBlock`) with `Invoke-PodeGC` in the run's
+`finally`. It is the same blocking gen2 collection as in patch 9, suspending
+every request thread. Patch 10 drops both calls; `Reset-PodeRunspaceName` and
+the rest of each `finally` stay. After patches 9 and 10, the only forced
+collection left is in `Close-PodeRunspace`, at shutdown and restart.
+
+How often these ran is in patch 9's "stay forced" list:
+
+- Supply-Depot: two per schedule tick, about 24 an hour from `Send-Webhooks`
+  alone.
+- Orbital-Command: the 5-minute reaper; and one per interactive AD read, which
+  its own caller waits for, because `Wait-PodeTask` returns only after the
+  task's `finally`.
+
+What the collection could release. When the `finally` runs, the run's
+PowerShell instance, its pipeline, the `Result` collection, the process entry
+and the run's parameters (`ArgumentList`, `$using:` copies) are all still
+referenced from `Tasks.Processes` / `Schedules.Processes`. That collection
+can free none of them, only the run's own temporaries that went out of scope,
+plus whatever earlier runs had already closed. Those objects are released
+explicitly and later:
+
+- Tasks: `Close-PodeTaskInternal` disposes the pipeline and `Result` and
+  removes the entry. `Wait-PodeTask` calls it, or the task housekeeper after
+  the completed or failed retention (patches 1, 2, 6).
+- Schedules: `Close-PodeScheduleInternal` does the same, from the schedule
+  housekeeper (patch 4).
+- Runspaces are pooled and reused, not freed per run.
+
+Nothing in the task or schedule machinery depends on the collection. The only
+finalizer path is patch 6's abandoned wedged pipeline, and a collection cannot
+reclaim that while it is still blocked.
+
+What the collections were for everything else. `[GC]::Collect()` collects the
+whole process. With patch 9 in place, these collections were the only regular
+finalization cadence left for all other garbage, request runspaces included:
+
+- at least one every 5 minutes in each app (Orbital-Command's
+  `over-budget-run-reaper`, Supply-Depot's `Send-Webhooks`);
+- plus one per AD read in Orbital-Command.
+
+Patch 10 removes that cadence. Finalizers now run when the runtime itself
+collects:
+
+- gen0/gen1 every 0.5 to 2.5 minutes in the review's idle run of patch 9
+  (no load, no schedule);
+- gen2 about every 1.3 minutes under load in this run, and every 2 minutes
+  with only the health poll and the minute schedule;
+- a gen2 is not guaranteed while a server is truly idle.
+
+One path where "later" might matter, unmeasured and uncertain: ADSI objects
+that Orbital-Command never disposes and that were promoted to gen2. They
+keep ADSI's cached LDAP connection open until the next gen2, possibly past
+the domain controller's idle timeout (`MaxConnIdleTime`, 900 s by default).
+Whether ADSI then reconnects transparently was not tested.
+`Zuescho/Orbital-Command#1181` disposes those objects; roll patch 10 out to
+Orbital-Command with or after it.
+
+If a finalization cadence is ever wanted back, a local
+`[GC]::Collect(2, [GCCollectionMode]::Forced, $false)` in the two `finally`
+blocks gives it as a background collection; the public `Invoke-PodeGC` would
+stay as it is. The review measured it in an isolated process (713 MB heap,
+20,000 finalizable objects in gen2): that call returned in 0.4-0.6 ms, paused 1.0-1.7 ms, and finalized
+all 20,000 within 3 s, against 181-388 ms for `[GC]::Collect()`. It has not
+been measured inside Pode under load.
+
+Measured on three Supply-Depot side servers side by side (unpatched, patch 9,
+patches 9 + 10), each on a copy of the production-sized database, for
+67 minutes. `SD_SUPPRESS_SCHEDULES=1` stayed set, so no real schedule could
+act. The real path was exercised two ways:
+
+- A diagnostic schedule registered every minute through the app's own
+  trigger: schedule run → `Invoke-PlatformScheduleTrigger` → `run-script`
+  task → `Find-DuplicateLocations`.
+- A manual `Test-AuditChain` run every 2 minutes.
+
+List-read load ran to minute 45, then the servers idled with the schedule
+still ticking. `/api/health` was polled every 250 ms for 65 minutes, and a GC
+event probe and 30-second counter samples ran inside each process. Minutes in
+the table count from the start of the health poll.
+
+| | unpatched | patch 9 | patches 9 + 10 |
+|---|---|---|---|
+| `/api/health` stalls over 150 ms | 795 | 168 | 19 |
+| p99 | 1,144 ms | 487 ms | 38 ms |
+| induced gen2 collections | 835 | 152 | 0 |
+| time paused by them | 700 s | 137 s | 0 |
+| all GC pauses, first to last sample | 829 s | 243 s | 107 s |
+| private bytes at min 45 / 55 / 65 | 1,400 / 1,652 / 1,492 MB | 1,460 / 1,474 / 1,436 MB | 1,536 / 1,534 / 1,536 MB |
+| private bytes while idle (min 45 on), range | 1,400-1,758 MB | 1,424-1,488 MB | 1,533-1,536 MB |
+| `GC.GetTotalMemory(false)` at min 45 / 65 | 1,121 / 1,116 MB | 1,170 / 1,130 MB | 1,141 / 1,129 MB |
+| heap fragmentation at min 65 | 171 MB | 83 MB | 209 MB |
+| last collection's finalization-pending count, max under load / idle | 73 / 26 | 49 / 56 | 10 / 40 |
+| handles while idle | 1,259-1,288 | 1,267-1,305 | 1,262-1,305 |
+| threads while idle | 44-48 | 44-47 | 45-48 |
+| gen2 collections while idle | 258 | 42 | 10 |
+
+How to read the table:
+
+- `GC.GetTotalMemory(false)` includes garbage not yet collected. On the
+  unpatched server, collected every few seconds, it is close to the live set;
+  on patches 9 + 10 it is an upper bound. So the live set there is not larger
+  than on the other two, and it is flat while idle.
+- Private bytes on patches 9 + 10 sit 70-100 MB above patch 9 at the end
+  (more fragmentation, fewer compactions). That is flat while idle, and within
+  the range the unpatched server itself swings through. Private-bytes slopes
+  are left out: on the sawtooth servers they depend on the window chosen.
+- Fragmentation on patches 9 + 10, in 5-minute steps from the poll start: 91,
+  66, 101, 176, 166, 142, 130, 147, 151, 199, 211, 211, 212, 209 MB. It
+  stopped changing when the load stopped. The unpatched server swings between
+  74 and 407 MB at the same steps. No run longer than 67 minutes exists, so a
+  slow climb until the runtime's next compacting collection is possible and
+  unmeasured.
+- Handles and threads stayed flat. The finalization-pending figure is the
+  last collection's snapshot, stale when collections are rare; it stayed low,
+  but it does not show that the finalization queue never builds up.
+- The runtime's own occasional blocking collection remains. The largest stall
+  on patches 9 + 10 (1,695 ms) was one allocation-triggered blocking gen2 of
+  1,659 ms at minute 5.4.
+
+Tests:
+
+- `tests/unit/Tasks.Tests.ps1` (`Get-PodeTaskScriptBlock`) and
+  `Schedules.Tests.ps1` (`Get-PodeScheduleScriptBlock`) run the real
+  end-of-run script block ten times each. Like patch 9's timer test, each
+  counts the runs that saw a full blocking collection and allows one.
+- With patch 9 alone both fail with 10.
+- They passed ten runs per file, and ten runs of those two plus
+  `Timers.Tests.ps1` in one process. The whole unit folder through
+  `Invoke-Build Test -TestType Unit`: 1,980 passed, 1 NotRun.
+- PS7 only, skipped on Windows PowerShell.
+
+Not measured:
+
+- Orbital-Command at runtime, including the per-user `ad-read` bursts of its
+  `-Apply` add-ins (`Sync-SupplyDepotMobileNumbers`,
+  `Sync-SupplyDepotOfficeMoves`: one AD read per target user, each until now
+  followed by a collection); whether the ActiveDirectory module leaves ADWS
+  channels to finalization; and the ADSI connection path above.
+- Production.
+- Anything longer than 67 minutes.
+- No end-of-run flush was taken.
+
+Not reported upstream yet.
+
+On the next upstream upgrade, check that:
+
+- `Get-PodeTaskScriptBlock` and `Get-PodeScheduleScriptBlock` still have no
+  `Invoke-PodeGC` and no direct `[System.GC]::Collect` (`Tasks.Tests.ps1` and
+  `Schedules.Tests.ps1` pin them).
+- `Close-PodeRunspace` is the only caller of `Invoke-PodeGC` left under
+  `src/`. The public `Invoke-PodeGC` itself is unchanged, for apps that call
+  it.
 
 ## Build and CI
 

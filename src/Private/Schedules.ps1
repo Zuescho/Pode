@@ -371,7 +371,9 @@ function Get-PodeScheduleScriptBlock {
         }
         finally {
             Reset-PodeRunspaceName
-            Invoke-PodeGC
+
+            # [Orbital-Command patch #10] No forced collection at the end of a
+            # run: it blocks every request thread. See PATCHES.md.
         }
     }
 }
