@@ -306,6 +306,104 @@ one existing helper test as NotRun (1,950 discovered). Changed-file PSScriptAnal
 Pool limits are changed only inside the test process. The fixture is PS7-only,
 matching the investigated environment; normal production APIs remain PS5-compatible.
 
+**Windows PowerShell 5.1 keeps upstream's acquisition** (Orbital-Command
+[#1182](https://github.com/Zuescho/Orbital-Command/issues/1182)). With the
+synchronous call a 5.1 server never finished stopping or restarting.
+`Close-PodeServer` cancels the Terminate token; the KeepAlive runspace then
+disposes the listener, and with it the context queue's `BlockingCollection`,
+while idle workers are blocked in `Take(token)`. `Close-PodeRunspace` cancels
+the Cancellation token only after that. On .NET Framework,
+`SemaphoreSlim.Dispose` drops the lock object its cancellation callback
+pulses: the cancel throws `ArgumentNullException` (the `AggregateException`
+that `Close-PodeCancellationTokenRequest` already ignores on 5.1) and the
+waiter is never woken. Disposing the worker's pipeline then waits forever for
+a pipeline that is inside a .NET call. .NET 8+ keeps the lock object after
+dispose, so on PowerShell 7 the waiter throws `OperationCanceledException`
+and the worker leaves through the existing catch. Upstream's `Wait-PodeTask`
+waits on the task with the token, so its runspace returns; only the pool
+thread stays blocked in `Take` until the process ends.
+
+Evidence on 5.1.26100 (.NET Framework 4.8):
+
+- A one-route server with timestamps around each teardown step: one second
+  after `/close` the teardown reached disposing `Web/Listener` (pipeline
+  Running, both workers inside `GetContext`) and stayed there; the process
+  was still running 300 s later. With the server in `Start-Job`, as the
+  integration tests run it, `Remove-Job -Force` gives up after its own 120 s.
+  That is the CI's ~133 s per file (`RestApi` 134 s, integration 1,304 s,
+  against 15.5 s and 237 s on upstream).
+- A runspace blocked in `Take(token)` on a disposed `BlockingCollection`:
+  after `Cancel()` it is still blocked on .NET Framework and throws
+  `OperationCanceledException` on .NET 10. Without the dispose, both runtimes
+  cancel.
+
+Fix: each HTTP worker checks `Test-PodeIsPSCore` once. PowerShell 7 runs the
+same `GetContext(token)` statement as before. Windows PowerShell runs
+upstream's `GetContextAsync` + `Wait-PodeTask`, written as two statements so
+that `$context = $Listener.GetContext...` stays the file's only acquisition
+statement. On 5.1 the fork is upstream again: the pool-thread acquisition
+this patch removes on 7 is back there (starvation not measured on 5.1; both
+apps run PowerShell 7), and so is upstream's leak. Each HTTP worker leaves
+one CLR pool thread blocked in `Take` on the disposed collection, one set at
+every stop and again at every `Restart-PodeServer`, held until the process
+ends. That follows from the code and the probe above; it was not counted.
+
+The starvation fixture executes only that one `GetContext` statement, so it
+cannot tell which arm a worker takes: with the predicate forced to `$true` it
+still passes. The second `Describe` in `HttpListenerAcquire.Tests.ps1` runs
+the shipped branch, the predicate assignment and the `if`/`else` taken from
+the file's AST, against a stand-in listener that records the call. It expects
+`GetContext` on PowerShell 7 and `GetContextAsync` under Windows PowerShell.
+Mutants: `$acquireOnPool = $true` and `= (Test-PodeIsWindows)` fail it on
+PowerShell 7; `= !(Test-PodeIsWindows)` fails it under 5.1. The fixture's
+three pins pass on all three.
+
+Measured on the workstation (Pester 6.0.1, `TestNoBuild` against the
+committed `src/Libs`; suites as unit and integration in one run, as CI does):
+
+- 5.1, single files before / after: `RestApi` 139 / 15 s, `Timers` 134 / 14 s,
+  `WebPages` 136 / 18 s. Unit and integration after: unit 1,974 passed,
+  3 skipped, 1 NotRun; integration 86 passed in 203 s, plus the locale
+  failure below.
+- PowerShell 7.6, before / after: unit 1,977 passed, 1 NotRun in both runs,
+  `HttpListenerAcquire` included; integration 85 passed, 237 / 173 s (every
+  file was faster in the second run, including files the change cannot
+  reach: machine load). The new test is skipped on 7. Both runs and both
+  runtimes fail only the `WebSocket` date regex, which expects `en-US` dates.
+  Single files, base and fixed run alternately twice: `RestApi` 18.0, 18.2 /
+  17.6, 18.1 s, `Timers` 15.9, 15.9 / 15.9, 15.5 s, `WebPages` 14.9, 14.5 /
+  14.0, 14.6 s.
+- Starvation on PowerShell 7, with sixteen workers, `DOTNET_PROCESSOR_COUNT=2`
+  and the CLR pool capped at four worker threads once the server is up: before
+  and after, 32 concurrent requests all succeed in 92 ms and a pool work item
+  starts within 7 ms. The same server with upstream's acquisition stalls on
+  every request (10 s client timeouts) and cannot stop; uncapped, its 32
+  concurrent requests took 4.5 s.
+- Stop and restart on PowerShell 7, before and after (eight workers, 32
+  concurrent requests, two `Restart-PodeServer` rounds confirmed by a new
+  start id, then `Close-PodeServer`): every request answered, 14 runspaces
+  open after each restart as at the start, the process ended 2.1–2.2 s after
+  `/close` with one runspace left. The error log held only a deliberate
+  route error in both, the same apart from timestamps, ids, paths and the
+  listener's line number. 5.1 after the fix: the same run restarted twice
+  and ended 1.9 s after `/close`.
+
+`tests/integration/ServerShutdown.Tests.ps1` (Windows PowerShell only) starts
+a server process with a per-run token. It waits until `/identity` answers with
+that token, so another server on the port cannot pass for it, then requests
+`/close`. It expects the process to end within 30 s with exit code 0 (three of
+three clean stops under 5.1 returned 0). Every request has a timeout, and the
+process is killed on any failure. On the unpatched head it fails at the exit
+wait. With another server already holding the port it fails at the token check.
+With the fix it passes in 9–18 s.
+
+Re-check on the next upgrade: whether upstream still disposes the listener
+before it cancels the Cancellation token, and whether `PodeItemQueue` still
+disposes its collection under a waiter. If either changes, 5.1 could take the
+synchronous call too. Re-run `ServerShutdown.Tests.ps1` under
+`powershell.exe` and `HttpListenerAcquire.Tests.ps1` under both pwsh and
+`powershell.exe`.
+
 ### 8. `src/Private/Logging.ps1` — `Add-PodeLogTypeInternal` default `-Version 1`
 
 New in 2.14.2, found while testing the 2.14.2 port. A custom log type added
@@ -666,11 +764,11 @@ At most one entry right after startup:
 
 ```
 Message: You cannot call a method on a null-valued expression.
-StackTrace: at <ScriptBlock>, <No file>: line 28
+StackTrace: at <ScriptBlock>, <No file>: line 38
 ```
 
-It's the web listener (`Start-PodeWebServer`, line 28 of its scriptblock with
-patch 7's comment lines, line 26 on pristine upstream) getting a context whose
+It's the web listener (`Start-PodeWebServer`, line 38 of its scriptblock with
+patch 7's branch, line 26 on pristine upstream) getting a context whose
 `Request.Strategy` is still `$null`. The outer `finally` disposes the context,
 so nothing leaks and no client request goes unanswered. It's timing-dependent:
 pristine upstream 2.14.2 produces it at startup in roughly half of the test
