@@ -7,7 +7,8 @@ four concurrency races in the task/schedule-pool plumbing, one Int32
 truncation in the IIS auth handler, a real-cancel rework of the task
 teardown path (stop before dispose), HTTP listener thread-pool starvation,
 and a 2.14 custom-log-type regression. Supply-Depot also consumes this fork.
-Everything else is unchanged upstream.
+Everything else is unchanged upstream, apart from the build-script default
+under "Build and CI".
 See Orbital-Command's `docs/Platform-Plan.md` §15d for the concurrency-race
 diagnosis.
 
@@ -326,6 +327,49 @@ Patch: `$Version = 1` on the internal parameter.
 unset `-Version` (direct and via `Add-PodeLogger`) and an explicit 2; without
 the patch the two Version-1 tests fail with "Expected 1, but got 0".
 Not reported upstream yet. Worth an issue + PR.
+
+## Build and CI
+
+### `pode.build.ps1` — default `-Version` from the manifest
+
+The apps load the fork straight from a checkout, so `src/Pode.psd1` pins
+`ModuleVersion = '2.14.2'` where upstream keeps the `'$version$'` placeholder
+until its release build stamps it. `Pode.psm1` compares a `Pode.dll` that is
+already loaded in the process with that version and skips the comparison only
+for the placeholder. Upstream's build defaults `-Version` to `0.0.0`, so the
+`Invoke-Build Test` that every "Pode CI" workflow runs built a 0.0.0.0
+listener. The compliance tests import the module first (nothing loaded yet,
+so no comparison) and load that DLL; the unit suite's `Setup.ps1` then
+re-imports with `-Force` in the same process and is refused with "An existing
+incompatible Pode.DLL version 0.0.0.0 is loaded. Version 2.14.2.0 is
+required." Discovery of 31 of the 32 unit files failed on every workflow and
+platform, and the unit and integration suites never ran on this branch.
+
+Fix: when `-Version` is not passed, the build takes `ModuleVersion` from
+`src/Pode.psd1`, unless it is the placeholder. CI now builds the listener from
+`src/Listener` (unchanged from upstream) as 2.14.2 and runs every suite
+against it. That build's `Pode.deps.json` matches the committed one; the DLLs
+are the same size and differ only as separate builds do. CI does not load the
+committed `src/Libs` binaries themselves. A build that passes `-Version` (the
+release workflow) is unaffected, and with the placeholder the behaviour is
+upstream's.
+
+Measured locally with `Invoke-Build Test` (pwsh 7.6, .NET SDK 10, Pester
+6.0.1): before, compliance 5,394 passed and the unit run failed exactly as in
+CI; after, compliance 5,394 passed, unit 1,977 passed, 0 failed, 1 NotRun
+(upstream v2.14.2's CI: 1,963 passed, 1 NotRun, without the fork's tests).
+Integration failed one test only on this German-locale workstation
+(`WebSocket` date regex against `25.11.2026`); the build sets only the UI
+culture, and the CI runners format dates in `en-US`.
+
+Running `Invoke-Build Build` or `Test` locally replaces the committed
+`src/Libs` (and the `MoveLibs` step rewrites `licenses/LICENSE.redoc.txt`):
+restore them with `git checkout -- src/Libs licenses` before committing.
+
+Upstream status: not applicable; upstream's manifest keeps the placeholder.
+Re-check on the next upgrade: if `pode.build.ps1` conflicts, keep the block
+right after the `param()` block; after pinning `ModuleVersion`, the "Run
+Pester Tests" step must report unit totals, not "Container failed".
 
 ## Upgrade procedure
 
