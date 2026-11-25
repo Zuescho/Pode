@@ -446,6 +446,39 @@ Nothing in the task or schedule machinery depends on the collection. The only
 finalizer path is patch 6's abandoned wedged pipeline, and a collection cannot
 reclaim that while it is still blocked.
 
+What the collections were for everything else. `[GC]::Collect()` collects the
+whole process. With patch 9 in place, these collections were the only regular
+finalization cadence left for all other garbage, request runspaces included:
+
+- at least one every 5 minutes in each app (Orbital-Command's
+  `over-budget-run-reaper`, Supply-Depot's `Send-Webhooks`);
+- plus one per AD read in Orbital-Command.
+
+Patch 10 removes that cadence. Finalizers now run when the runtime itself
+collects:
+
+- gen0/gen1 every 0.5 to 2.5 minutes in the review's idle run of patch 9
+  (no load, no schedule);
+- gen2 about every 1.3 minutes under load in this run, and every 2 minutes
+  with only the health poll and the minute schedule;
+- a gen2 is not guaranteed while a server is truly idle.
+
+One path where "later" might matter, unmeasured and uncertain: ADSI objects
+that Orbital-Command never disposes and that were promoted to gen2. They
+keep ADSI's cached LDAP connection open until the next gen2, possibly past
+the domain controller's idle timeout (`MaxConnIdleTime`, 900 s by default).
+Whether ADSI then reconnects transparently was not tested.
+`Zuescho/Orbital-Command#1181` disposes those objects; roll patch 10 out to
+Orbital-Command with or after it.
+
+If a finalization cadence is ever wanted back, a local
+`[GC]::Collect(2, [GCCollectionMode]::Forced, $false)` in the two `finally`
+blocks gives it as a background collection; the public `Invoke-PodeGC` would
+stay as it is. The review measured it in an isolated process (713 MB heap,
+20,000 finalizable objects in gen2): that call returned in 0.4-0.6 ms, paused 1.0-1.7 ms, and finalized
+all 20,000 within 3 s, against 181-388 ms for `[GC]::Collect()`. It has not
+been measured inside Pode under load.
+
 Measured on three Supply-Depot side servers side by side (unpatched, patch 9,
 patches 9 + 10), each on a copy of the production-sized database, for
 67 minutes. `SD_SUPPRESS_SCHEDULES=1` stayed set, so no real schedule could
@@ -458,7 +491,8 @@ act. The real path was exercised two ways:
 
 List-read load ran to minute 45, then the servers idled with the schedule
 still ticking. `/api/health` was polled every 250 ms for 65 minutes, and a GC
-event probe and 30-second counter samples ran inside each process.
+event probe and 30-second counter samples ran inside each process. Minutes in
+the table count from the start of the health poll.
 
 | | unpatched | patch 9 | patches 9 + 10 |
 |---|---|---|---|
@@ -466,20 +500,38 @@ event probe and 30-second counter samples ran inside each process.
 | p99 | 1,144 ms | 487 ms | 38 ms |
 | induced gen2 collections | 835 | 152 | 0 |
 | time paused by them | 700 s | 137 s | 0 |
-| all GC pauses, whole run | 829 s | 243 s | 107 s |
-| private bytes at min 45 / 55 / 65 | 1,410 / 1,615 / 1,464 MB | 1,416 / 1,473 / 1,435 MB | 1,545 / 1,534 / 1,536 MB |
-| private bytes while idle (min 47 on) | 1,404-1,758 MB, +112 MB/h | 1,424-1,488 MB, −91 MB/h | 1,533-1,536 MB, +7 MB/h |
-| live managed heap at min 45 / 65 | 1,120 / 1,123 MB | 1,149 / 1,129 MB | 1,137 / 1,118 MB |
-| heap fragmentation at min 65 | 141 MB | 84 MB | 213 MB |
-| finalization pending, max under load / idle | 73 / 26 | 49 / 56 | 10 / 40 |
-| handles while idle | 1,259-1,288 | 1,267-1,294 | 1,262-1,305 |
-| gen2 collections while idle | 246 | 40 | 10 |
+| all GC pauses, first to last sample | 829 s | 243 s | 107 s |
+| private bytes at min 45 / 55 / 65 | 1,400 / 1,652 / 1,492 MB | 1,460 / 1,474 / 1,436 MB | 1,536 / 1,534 / 1,536 MB |
+| private bytes while idle (min 45 on), range | 1,400-1,758 MB | 1,424-1,488 MB | 1,533-1,536 MB |
+| `GC.GetTotalMemory(false)` at min 45 / 65 | 1,121 / 1,116 MB | 1,170 / 1,130 MB | 1,141 / 1,129 MB |
+| heap fragmentation at min 65 | 171 MB | 83 MB | 209 MB |
+| last collection's finalization-pending count, max under load / idle | 73 / 26 | 49 / 56 | 10 / 40 |
+| handles while idle | 1,259-1,288 | 1,267-1,305 | 1,262-1,305 |
+| threads while idle | 44-48 | 44-47 | 45-48 |
+| gen2 collections while idle | 258 | 42 | 10 |
 
-The live managed heap is the same on all three and flat while idle.
-Patches 9 + 10 hold 70-100 MB more private bytes than patch 9 at the end
-(more fragmentation, fewer compactions). That is flat, and within the range
-the unpatched server itself swings through. Handles, threads (45-47) and the
-finalization queue do not build up.
+How to read the table:
+
+- `GC.GetTotalMemory(false)` includes garbage not yet collected. On the
+  unpatched server, collected every few seconds, it is close to the live set;
+  on patches 9 + 10 it is an upper bound. So the live set there is not larger
+  than on the other two, and it is flat while idle.
+- Private bytes on patches 9 + 10 sit 70-100 MB above patch 9 at the end
+  (more fragmentation, fewer compactions). That is flat while idle, and within
+  the range the unpatched server itself swings through. Private-bytes slopes
+  are left out: on the sawtooth servers they depend on the window chosen.
+- Fragmentation on patches 9 + 10, in 5-minute steps from the poll start: 91,
+  66, 101, 176, 166, 142, 130, 147, 151, 199, 211, 211, 212, 209 MB. It
+  stopped changing when the load stopped. The unpatched server swings between
+  74 and 407 MB at the same steps. No run longer than 67 minutes exists, so a
+  slow climb until the runtime's next compacting collection is possible and
+  unmeasured.
+- Handles and threads stayed flat. The finalization-pending figure is the
+  last collection's snapshot, stale when collections are rare; it stayed low,
+  but it does not show that the finalization queue never builds up.
+- The runtime's own occasional blocking collection remains. The largest stall
+  on patches 9 + 10 (1,695 ms) was one allocation-triggered blocking gen2 of
+  1,659 ms at minute 5.4.
 
 Tests:
 
@@ -498,8 +550,8 @@ Not measured:
 - Orbital-Command at runtime, including the per-user `ad-read` bursts of its
   `-Apply` add-ins (`Sync-SupplyDepotMobileNumbers`,
   `Sync-SupplyDepotOfficeMoves`: one AD read per target user, each until now
-  followed by a collection), and whether the ActiveDirectory module leaves
-  ADWS channels to finalization.
+  followed by a collection); whether the ActiveDirectory module leaves ADWS
+  channels to finalization; and the ADSI connection path above.
 - Production.
 - Anything longer than 67 minutes.
 - No end-of-run flush was taken.
