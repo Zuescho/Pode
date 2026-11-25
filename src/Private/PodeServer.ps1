@@ -120,13 +120,23 @@ function Start-PodeWebServer {
             # Waits for the Pode server to fully start before proceeding with further operations.
             Wait-PodeCancellationTokenRequest -Type Start
 
+            # Shutdown disposes the listener's queue before it cancels the token. On .NET Framework
+            # that cancel cannot wake a blocked GetContext, so Windows PowerShell waits on a pool task.
+            $acquireOnPool = !(Test-PodeIsPSCore)
+
             do {
                 try {
                     while ($Listener.IsConnected -and !(Test-PodeCancellationTokenRequest -Type Terminate, Cancellation -Match All)) {
-                        # This dedicated runspace already owns the blocking worker.
-                        # GetContextAsync schedules BlockingCollection.Take on the shared
-                        # CLR pool, starving socket receive tasks when workers are idle.
-                        $context = $Listener.GetContext($PodeContext.Tokens.Cancellation.Token)
+                        if ($acquireOnPool) {
+                            $contextTask = $Listener.GetContextAsync($PodeContext.Tokens.Cancellation.Token)
+                            $context = (Wait-PodeTask -Task $contextTask)
+                        }
+                        else {
+                            # This dedicated runspace already owns the blocking worker.
+                            # GetContextAsync schedules BlockingCollection.Take on the shared
+                            # CLR pool, starving socket receive tasks when workers are idle.
+                            $context = $Listener.GetContext($PodeContext.Tokens.Cancellation.Token)
+                        }
 
                         try {
                             try {
