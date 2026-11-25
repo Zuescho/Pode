@@ -194,4 +194,30 @@ InModuleScope -ModuleName 'Pode' {
             $PodeContext.Timers.Items['test1'].Script.ToString() | Should -Be ({ Write-Host 'hello2' }).ToString()
         }
     }
+
+    Describe 'Invoke-PodeTimer' {
+        It 'Runs the timer without forcing a full garbage collection' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+            $PodeContext = @{
+                Server    = @{ Root = $PWD.Path }
+                Threading = @{ Lockables = @{ Global = [hashtable]::Synchronized(@{}) } }
+                Timers    = @{ Items = @{} }
+            }
+            $state = @{ Ticks = 0 }
+            Add-PodeTimer -Name 'tick' -Interval 1 -ScriptBlock { param($State) $State.Ticks++ }
+
+            # [GC]::Collect() is a full blocking collection; the runtime's own gen2 runs in the
+            # background, and one blocking collection of its own may still land in a tick
+            $blockingTicks = 0
+            foreach ($i in 1..10) {
+                $lastBlocking = [System.GC]::GetGCMemoryInfo([System.GCKind]::FullBlocking).Index
+                Invoke-PodeTimer -Name 'tick' -ArgumentList @(, $state)
+                if ([System.GC]::GetGCMemoryInfo([System.GCKind]::FullBlocking).Index -ne $lastBlocking) {
+                    $blockingTicks++
+                }
+            }
+
+            $state.Ticks | Should -Be 10
+            $blockingTicks | Should -BeLessOrEqual 1
+        }
+    }
 }

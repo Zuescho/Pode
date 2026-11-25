@@ -132,7 +132,8 @@ function Invoke-PodeInternalTimer {
     catch {
         $_ | Write-PodeErrorLog
     }
-    finally {
-        Invoke-PodeGC
-    }
+
+    # [Orbital-Command patch #9] No forced collection after a tick: [GC]::Collect()
+    # is a blocking full collection that suspends every request thread, and the
+    # housekeeper timers tick every 10-30 seconds. See PATCHES.md.
 }
