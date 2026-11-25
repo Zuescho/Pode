@@ -333,4 +333,36 @@ InModuleScope -ModuleName 'Pode' {
             $PodeContext.Schedules.Items['test1'].Script.ToString() | Should -Be ({ Write-Host 'hello2' }).ToString()
         }
     }
+
+    Describe 'Get-PodeScheduleScriptBlock' {
+        It 'Runs a schedule without forcing a full garbage collection' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+            $PodeContext = @{
+                Server    = @{ Root = $PWD.Path }
+                Threading = @{ Lockables = @{ Global = [hashtable]::Synchronized(@{}) } }
+                Schedules = @{ Items = @{}; Processes = [hashtable]::Synchronized(@{}) }
+            }
+            Add-PodeSchedule -Name 'work' -Cron '@hourly' -ScriptBlock { param($State) $State.Runs++ }
+            $state = @{ Runs = 0 }
+            $scheduleScript = Get-PodeScheduleScriptBlock
+
+            # [GC]::Collect() is a full blocking collection; the runtime's own gen2 runs in the
+            # background, and one blocking collection of its own may still land in a run
+            $blockingRuns = 0
+            foreach ($i in 1..10) {
+                $PodeContext.Schedules.Processes["p$i"] = @{
+                    ID = "p$i"; Schedule = 'work'; State = 'Pending'; ExpireTime = $null
+                    Timeout = @{ Value = -1; From = 'Create' }
+                }
+                $lastBlocking = [System.GC]::GetGCMemoryInfo([System.GCKind]::FullBlocking).Index
+                $null = & $scheduleScript -ProcessId "p$i" -ArgumentList @{ State = $state }
+                if ([System.GC]::GetGCMemoryInfo([System.GCKind]::FullBlocking).Index -ne $lastBlocking) {
+                    $blockingRuns++
+                }
+            }
+
+            $state.Runs | Should -Be 10
+            @($PodeContext.Schedules.Processes.Values | Where-Object { $_.State -eq 'Completed' }).Count | Should -Be 10
+            $blockingRuns | Should -BeLessOrEqual 1
+        }
+    }
 }
