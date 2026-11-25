@@ -338,10 +338,23 @@ Evidence on 5.1.26100 (.NET Framework 4.8):
 Fix: each HTTP worker checks `Test-PodeIsPSCore` once. PowerShell 7 runs the
 same `GetContext(token)` statement as before. Windows PowerShell runs
 upstream's `GetContextAsync` + `Wait-PodeTask`, written as two statements so
-that the fixture's AST lookup still finds exactly one acquisition, the
-PowerShell 7 one. On 5.1 the fork is upstream again, including the pool-thread
-acquisition this patch removes on 7 (starvation not measured on 5.1; both apps
-run PowerShell 7).
+that `$context = $Listener.GetContext...` stays the file's only acquisition
+statement. On 5.1 the fork is upstream again: the pool-thread acquisition
+this patch removes on 7 is back there (starvation not measured on 5.1; both
+apps run PowerShell 7), and so is upstream's leak. Each HTTP worker leaves
+one CLR pool thread blocked in `Take` on the disposed collection, one set at
+every stop and again at every `Restart-PodeServer`, held until the process
+ends. That follows from the code and the probe above; it was not counted.
+
+The starvation fixture executes only that one `GetContext` statement, so it
+cannot tell which arm a worker takes: with the predicate forced to `$true` it
+still passes. The second `Describe` in `HttpListenerAcquire.Tests.ps1` runs
+the shipped branch, the predicate assignment and the `if`/`else` taken from
+the file's AST, against a stand-in listener that records the call. It expects
+`GetContext` on PowerShell 7 and `GetContextAsync` under Windows PowerShell.
+Mutants: `$acquireOnPool = $true` and `= (Test-PodeIsWindows)` fail it on
+PowerShell 7; `= !(Test-PodeIsWindows)` fails it under 5.1. The fixture's
+three pins pass on all three.
 
 Measured on the workstation (Pester 6.0.1, `TestNoBuild` against the
 committed `src/Libs`; suites as unit and integration in one run, as CI does):
@@ -374,15 +387,20 @@ committed `src/Libs`; suites as unit and integration in one run, as CI does):
   and ended 1.9 s after `/close`.
 
 `tests/integration/ServerShutdown.Tests.ps1` (Windows PowerShell only) starts
-a server process, requests `/close` and expects the process to end within
-30 s. It fails at that assertion on the unpatched head and passes in 9–16 s
-with the fix.
+a server process with a per-run token. It waits until `/identity` answers with
+that token, so another server on the port cannot pass for it, then requests
+`/close`. It expects the process to end within 30 s with exit code 0 (three of
+three clean stops under 5.1 returned 0). Every request has a timeout, and the
+process is killed on any failure. On the unpatched head it fails at the exit
+wait. With another server already holding the port it fails at the token check.
+With the fix it passes in 9–18 s.
 
 Re-check on the next upgrade: whether upstream still disposes the listener
 before it cancels the Cancellation token, and whether `PodeItemQueue` still
 disposes its collection under a waiter. If either changes, 5.1 could take the
 synchronous call too. Re-run `ServerShutdown.Tests.ps1` under
-`powershell.exe` and `HttpListenerAcquire.Tests.ps1` under pwsh.
+`powershell.exe` and `HttpListenerAcquire.Tests.ps1` under both pwsh and
+`powershell.exe`.
 
 ### 8. `src/Private/Logging.ps1` — `Add-PodeLogTypeInternal` default `-Version 1`
 
@@ -507,7 +525,7 @@ At most one entry right after startup:
 
 ```
 Message: You cannot call a method on a null-valued expression.
-StackTrace: at <ScriptBlock>, <No file>: line 28
+StackTrace: at <ScriptBlock>, <No file>: line 38
 ```
 
 It's the web listener (`Start-PodeWebServer`, line 38 of its scriptblock with
