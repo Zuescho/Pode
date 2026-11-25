@@ -7,7 +7,7 @@
     It includes tasks for setting up dependencies, compiling .NET targets, running tests, generating documentation, and packaging.
 
 .PARAMETER Version
-    Specifies the project version for stamping, packaging, and documentation. Defaults to '0.0.0'.
+    Specifies the project version for stamping, packaging, and documentation. Defaults to the ModuleVersion in src/Pode.psd1, or '0.0.0' while that holds the '$version$' placeholder.
 
 .PARAMETER PreRelease
     Specifies the prerelease label to append to the module version. Such as "rc1" or "preview1".
@@ -152,6 +152,16 @@ param(
     [switch]
     $SkipYarnInstall
 )
+
+# [Orbital-Command patch] src/Pode.psd1 pins ModuleVersion instead of the '$version$'
+# placeholder, and Pode.psm1 refuses a loaded Pode.dll of any other version. Unless
+# -Version is passed, build the listener with the manifest's version. See PATCHES.md.
+if (!$PSBoundParameters.ContainsKey('Version')) {
+    $manifestVersion = (Import-PowerShellDataFile -Path (Join-Path -Path $PSScriptRoot -ChildPath 'src/Pode.psd1')).ModuleVersion
+    if ($manifestVersion -ne '$version$') {
+        $Version = $manifestVersion
+    }
+}
 
 # Dependency Versions
 $Versions = @{
